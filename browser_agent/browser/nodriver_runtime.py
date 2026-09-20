@@ -16,7 +16,6 @@ from typing import Any, cast
 
 import nodriver
 from nodriver import cdp
-from nodriver.cdp.dom import BackendNodeId
 from nodriver.core.browser import Browser
 from nodriver.core.config import Config, find_chrome_executable
 
@@ -30,11 +29,11 @@ from .models import (
     BrowserShutdownError,
     ClosedTargetError,
     Observation,
-    OutcomeStatus,
     StaleTargetError,
 )
 from .nodriver_actions import click, navigate
-from .nodriver_dom import capture_observation
+from .nodriver_dom import ControlTarget, capture_observation
+from .nodriver_frames import FrameRegistry, find_frame
 from .runtime import OwnedBrowser, RuntimeFailure, RuntimeFailureKind
 
 
@@ -95,9 +94,9 @@ class NodriverOwnedBrowser:
         self._process = process
         self._launch_target_id = _target_id(browser)
         self._observation_count = 0
-        self._document_generation = 0
         self._current_observation_id: str | None = None
-        self._control_index: dict[str, BackendNodeId] = {}
+        self._control_index: dict[str, ControlTarget] = {}
+        self._frames = FrameRegistry(browser.main_tab)
 
     @property
     def process_id(self) -> int:
@@ -111,11 +110,12 @@ class NodriverOwnedBrowser:
         self._require_active_tab()
         self._observation_count += 1
         observation_id = f"obs-{self._observation_count}"
+        frame_root = await self._frames.reconcile()
         capture = await capture_observation(
             self._browser.main_tab,
             observation_id=observation_id,
             active_target_id=self._launch_target_id,
-            document_generation=self._document_generation,
+            frame_root=frame_root,
             limits=self._config.observation_limits,
         )
         self._current_observation_id = observation_id
@@ -139,8 +139,6 @@ class NodriverOwnedBrowser:
         if not isinstance(url, str):
             raise ValueError("navigate requires a string 'url' argument")
         result = await navigate(self._browser.main_tab, self._config, url)
-        if result.status is OutcomeStatus.SUCCEEDED:
-            self._document_generation += 1
         return result
 
     async def _execute_click(self, action: BrowserAction) -> ActionResult:
@@ -152,12 +150,26 @@ class NodriverOwnedBrowser:
                 f"target belongs to observation {target.observation_id}; "
                 f"current observation is {self._current_observation_id}"
             )
-        backend_node_id = self._control_index.get(target.control_id)
-        if backend_node_id is None:
+        control_target = self._control_index.get(target.control_id)
+        if control_target is None:
             raise StaleTargetError(
                 f"unknown control {target.control_id} for observation {target.observation_id}"
             )
-        return await click(self._browser.main_tab, backend_node_id, self._config.timeouts)
+        current_frame = find_frame(await self._frames.reconcile(), control_target.frame_id)
+        if (
+            current_frame is None
+            or current_frame.session is not control_target.session
+            or current_frame.document_generation != control_target.document_generation
+        ):
+            raise StaleTargetError(
+                f"control {target.control_id} belongs to a stale frame document; "
+                "take a fresh observation"
+            )
+        return await click(
+            control_target.session,
+            control_target.backend_node_id,
+            self._config.timeouts,
+        )
 
     def _require_active_tab(self) -> None:
         if _target_id(self._browser) != self._launch_target_id:
@@ -182,7 +194,17 @@ class NodriverOwnedBrowser:
             await self._browser.send(cdp.browser.close())
 
     async def close_connection(self) -> None:
-        await self._browser.aclose()
+        close_errors: list[Exception] = []
+        try:
+            await self._frames.close()
+        except Exception as error:
+            close_errors.append(error)
+        try:
+            await self._browser.aclose()
+        except Exception as error:
+            close_errors.append(error)
+        if close_errors:
+            raise ExceptionGroup("failed to close browser connections", close_errors)
 
     async def wait_for_exit(self) -> int:
         return await self._process.wait()

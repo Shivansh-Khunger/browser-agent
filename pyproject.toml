@@ -55,6 +55,8 @@ include = [
     "browser_agent/browser/models.py",
     "browser_agent/browser/nodriver_runtime.py",
     "browser_agent/browser/nodriver_dom.py",
+    "browser_agent/browser/nodriver_frames.py",
+    "browser_agent/browser/nodriver_semantics.py",
     "browser_agent/browser/nodriver_session.py",
     "browser_agent/browser/runtime.py",
     "browser_agent/browser/transport.py",

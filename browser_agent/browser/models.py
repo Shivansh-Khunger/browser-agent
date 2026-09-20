@@ -137,6 +137,7 @@ class ContextNode:
     text: str
     frame_breadcrumb: tuple[str, ...] = ()
     truncated: bool = False
+    frame_origin: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +159,7 @@ class SemanticControl:
     name_truncated: bool = False
     description_truncated: bool = False
     value_truncated: bool = False
+    frame_origin: str | None = None
 
     def __post_init__(self) -> None:
         if self.potentially_sensitive and self.value is not None:

@@ -67,6 +67,9 @@ async def navigate(tab: Tab, config: BrowserConfig, url: str) -> ActionResult:
             "completion before the timeout",
             error_code="settle_timeout",
         )
+    # LoadEventFired can precede OOPIF target attachment and nested-frame AX
+    # availability. Give Chromium one bounded settling window before observation.
+    await asyncio.sleep(config.timeouts.settle)
     return ActionResult(OutcomeStatus.SUCCEEDED, "navigate completed")
 
 
