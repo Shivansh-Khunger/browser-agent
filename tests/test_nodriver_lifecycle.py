@@ -370,6 +370,32 @@ async def test_installed_browser_unexpected_exit_leaks_no_process_or_profile_loc
 
 
 @pytest.mark.asyncio
+async def test_installed_browser_disconnect_leaks_no_process_or_profile_lock(
+    tmp_path,
+) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    state = LocalBrowserStateAdapter(tmp_path / "state", store)
+    session = NodriverSession(BrowserConfig(headless=True), state, policy(), episode_metadata())
+    await _start_or_skip(session)
+
+    profile = state._profile_directory(session._lease)  # type: ignore[arg-type]
+    runtime = session._runtime
+    assert runtime is not None
+    process_id = runtime.process_id
+    browser = runtime._browser  # type: ignore[attr-defined]
+    assert browser.socket is not None
+    await browser.socket.close()
+    await _wait_until_closed(session)
+
+    with pytest.raises(BrowserDisconnectedError):
+        await session.close()
+    assert session.terminal_checkpoint is None
+    assert session.diagnostic is not None
+    assert not profile.exists()
+    assert not _process_exists(process_id)
+
+
+@pytest.mark.asyncio
 async def test_installed_browser_forced_shutdown_leaks_no_process_or_profile_lock(
     tmp_path,
 ) -> None:

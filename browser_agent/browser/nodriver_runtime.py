@@ -141,13 +141,15 @@ class NodriverOwnedBrowser:
 
 
 def _resolve_executable(configured: Path | None) -> Path:
-    discovered = (
-        str(configured) if configured is not None else cast(str | None, find_chrome_executable())
-    )
-    if not discovered:
-        raise BrowserLaunchError(
-            "No installed Chrome or Chromium executable found; configure executable_path"
-        )
+    if configured is not None:
+        discovered = str(configured)
+    else:
+        try:
+            discovered = cast(str, find_chrome_executable())
+        except FileNotFoundError as error:
+            raise BrowserLaunchError(
+                "No installed Chrome or Chromium executable found; configure executable_path"
+            ) from error
     executable = Path(discovered).expanduser().resolve()
     if not executable.is_file():
         raise BrowserLaunchError(f"Browser executable does not exist: {executable}")
