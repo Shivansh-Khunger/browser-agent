@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,40 @@ class UnstoppableBrowser(FakeOwnedBrowser):
     async def force_stop(self, timeout: float) -> None:
         del timeout
         raise BrowserShutdownError("Chrome process exit could not be verified")
+
+
+class NoGracefulCloseBrowser:
+    def __init__(self, runtime) -> None:  # type: ignore[no-untyped-def]
+        self._runtime = runtime
+
+    def __getattr__(self, name):  # type: ignore[no-untyped-def]
+        return getattr(self._runtime, name)
+
+    async def request_close(self) -> None:
+        return None
+
+
+class PausedCloseBrowser(NoGracefulCloseBrowser):
+    def __init__(self, runtime) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(runtime)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def request_close(self) -> None:
+        self.entered.set()
+        await self.release.wait()
+        await self._runtime.request_close()
+
+
+class WrappingNodriverLauncher(NodriverLauncher):
+    def __init__(self, wrapper_type) -> None:  # type: ignore[no-untyped-def]
+        self.wrapper_type = wrapper_type
+        self.wrapper = None
+
+    async def launch(self, config, profile, metadata):  # type: ignore[no-untyped-def]
+        runtime = await super().launch(config, profile, metadata)
+        self.wrapper = self.wrapper_type(runtime)
+        return self.wrapper
 
 
 class ProfileStateAdapter(FakeBrowserStateAdapter):
@@ -263,6 +298,27 @@ async def test_explicit_executable_path_records_version_without_download(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_timed_out_version_probe_is_killed_and_reaped(tmp_path) -> None:
+    executable = tmp_path / "hanging-chromium"
+    pid_file = tmp_path / "version.pid"
+    executable.write_text(
+        f"#!/bin/sh\necho $$ > {str(pid_file)!r}\ntrap '' TERM\nwhile :; do :; done\n"
+    )
+    executable.chmod(0o700)
+
+    with pytest.raises(Exception, match="inspect browser version"):
+        await NodriverLauncher().inspect(
+            BrowserConfig(
+                executable_path=executable,
+                timeouts=TimeoutConfig(launch=0.5),
+            )
+        )
+
+    process_id = int(pid_file.read_text())
+    assert not _process_exists(process_id)
+
+
+@pytest.mark.asyncio
 async def test_installed_browser_releases_profile_lock_after_clean_close(tmp_path) -> None:
     store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
     state = LocalBrowserStateAdapter(tmp_path / "state", store)
@@ -313,16 +369,80 @@ async def test_installed_browser_unexpected_exit_leaks_no_process_or_profile_loc
     assert not _process_exists(process_id)
 
 
+@pytest.mark.asyncio
+async def test_installed_browser_forced_shutdown_leaks_no_process_or_profile_lock(
+    tmp_path,
+) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    state = LocalBrowserStateAdapter(tmp_path / "state", store)
+    launcher = WrappingNodriverLauncher(NoGracefulCloseBrowser)
+    session = NodriverSession(
+        BrowserConfig(headless=True, timeouts=TimeoutConfig(shutdown=0.05)),
+        state,
+        policy(),
+        episode_metadata(),
+        launcher=launcher,
+    )
+    await _start_or_skip(session)
+
+    profile = state._profile_directory(session._lease)  # type: ignore[arg-type]
+    process_id = session._runtime.process_id  # type: ignore[union-attr]
+    with pytest.raises(BrowserShutdownError, match="timed out"):
+        await session.close()
+
+    assert not profile.exists()
+    assert not _process_exists(process_id)
+
+
+@pytest.mark.asyncio
+async def test_installed_browser_cancelled_close_still_releases_process_and_lock(
+    tmp_path,
+) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    state = LocalBrowserStateAdapter(tmp_path / "state", store)
+    launcher = WrappingNodriverLauncher(PausedCloseBrowser)
+    session = NodriverSession(
+        BrowserConfig(headless=True),
+        state,
+        policy(),
+        episode_metadata(),
+        launcher=launcher,
+    )
+    await _start_or_skip(session)
+    wrapper = launcher.wrapper
+    assert isinstance(wrapper, PausedCloseBrowser)
+    profile = state._profile_directory(session._lease)  # type: ignore[arg-type]
+    process_id = session._runtime.process_id  # type: ignore[union-attr]
+
+    closing = asyncio.create_task(session.close())
+    await wrapper.entered.wait()
+    closing.cancel()
+    wrapper.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    assert session.terminal_checkpoint is not None
+    assert not profile.exists()
+    assert not _process_exists(process_id)
+
+
 async def _wait_until_closed(session: NodriverSession) -> None:
     async with asyncio.timeout(1):
         while session.lifecycle is not SessionLifecycle.CLOSED:
             await asyncio.sleep(0)
 
 
+async def _start_or_skip(session: NodriverSession) -> None:
+    try:
+        await session.start()
+    except Exception as error:
+        if "No installed Chrome or Chromium" in str(error):
+            pytest.skip(str(error))
+        raise
+
+
 def _process_exists(process_id: int) -> bool:
     try:
-        import os
-
         os.kill(process_id, 0)
     except ProcessLookupError:
         return False

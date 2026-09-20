@@ -261,8 +261,13 @@ class NodriverSession:
                 f"Chrome exited unexpectedly with status {failure.exit_code}"
             )
             cleanup_verified = True
-            with suppress(Exception):
-                await runtime.close_connection()
+            try:
+                async with asyncio.timeout(self._config.timeouts.shutdown):
+                    await runtime.close_connection()
+            except Exception:
+                error = BrowserShutdownError(
+                    "Chrome exited but DevTools connection cleanup timed out"
+                )
         if cleanup_verified:
             await self._abort_episode(lease, error)
         self._fatal_error = error

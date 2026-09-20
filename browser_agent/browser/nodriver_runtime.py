@@ -155,6 +155,7 @@ def _resolve_executable(configured: Path | None) -> Path:
 
 
 async def _browser_version(executable: Path, timeout: float) -> str:
+    process: asyncio.subprocess.Process | None = None
     try:
         process = await asyncio.create_subprocess_exec(
             str(executable),
@@ -165,6 +166,13 @@ async def _browser_version(executable: Path, timeout: float) -> str:
         async with asyncio.timeout(timeout):
             stdout, stderr = await process.communicate()
     except BaseException as error:
+        if process is not None:
+            try:
+                await asyncio.shield(_terminate_process(process, min(1.0, timeout)))
+            except BrowserShutdownError as cleanup_error:
+                raise BrowserShutdownError(
+                    "browser version process exit could not be verified"
+                ) from cleanup_error
         if isinstance(error, asyncio.CancelledError):
             raise
         raise BrowserLaunchError("Could not inspect browser version") from error
@@ -226,6 +234,8 @@ async def _discard_partial_browser(browser: Browser, timeout: float) -> None:
 
 
 async def _terminate_process(process: asyncio.subprocess.Process, timeout: float) -> None:
+    if process.returncode is not None:
+        return
     with suppress(ProcessLookupError):
         process.terminate()
     try:
