@@ -52,11 +52,41 @@ class TimeoutConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ObservationLimits:
+    """Harness-lowerable bounds with code-owned hard safety ceilings."""
+
+    controls: int = 150
+    context: int = 250
+    name: int = 200
+    description: int = 200
+    value: int = 50
+    context_text: int = 200
+
+    _CEILINGS = {
+        "controls": 500,
+        "context": 1000,
+        "name": 1000,
+        "description": 1000,
+        "value": 200,
+        "context_text": 1000,
+    }
+
+    def __post_init__(self) -> None:
+        for field_name, ceiling in self._CEILINGS.items():
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{field_name} limit must be a positive integer")
+            if value > ceiling:
+                raise ValueError(f"{field_name} limit cannot exceed hard ceiling {ceiling}")
+
+
+@dataclass(frozen=True, slots=True)
 class BrowserConfig:
     headless: bool = False
     executable_path: Path | None = None
     allowed_domains: tuple[str, ...] = ()
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
+    observation_limits: ObservationLimits = field(default_factory=ObservationLimits)
     locale: str | None = None
     timezone: str | None = None
     geolocation: tuple[float, float] | None = None
@@ -106,6 +136,7 @@ class ContextNode:
     kind: str
     text: str
     frame_breadcrumb: tuple[str, ...] = ()
+    truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +155,9 @@ class SemanticControl:
     bounds: tuple[float, float, float, float] | None = None
     fallback_reason: str | None = None
     potentially_sensitive: bool = False
+    name_truncated: bool = False
+    description_truncated: bool = False
+    value_truncated: bool = False
 
     def __post_init__(self) -> None:
         if self.potentially_sensitive and self.value is not None:

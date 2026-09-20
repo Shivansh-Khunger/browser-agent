@@ -116,6 +116,7 @@ class NodriverOwnedBrowser:
             observation_id=observation_id,
             active_target_id=self._launch_target_id,
             document_generation=self._document_generation,
+            limits=self._config.observation_limits,
         )
         self._current_observation_id = observation_id
         self._control_index = capture.control_index
@@ -258,6 +259,17 @@ def _config_digest(config: BrowserConfig) -> str:
             "geolocation": config.geolocation,
             "headless": config.headless,
             "locale": config.locale,
+            "observation_limits": {
+                name: getattr(config.observation_limits, name)
+                for name in (
+                    "controls",
+                    "context",
+                    "name",
+                    "description",
+                    "value",
+                    "context_text",
+                )
+            },
             "permissions": sorted(config.permissions),
             "timezone": config.timezone,
             "timeouts": {

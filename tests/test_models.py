@@ -5,6 +5,7 @@ import pytest
 from browser_agent.browser import (
     BrowserAction,
     Observation,
+    ObservationLimits,
     ScreenshotMetadata,
     SemanticControl,
     TargetHandle,
@@ -61,3 +62,12 @@ def test_contract_values_are_validated_and_immutable() -> None:
 
     with pytest.raises(ValueError, match="launch timeout"):
         TimeoutConfig(launch=0)
+
+
+def test_observation_limits_enforce_positive_hard_ceilings() -> None:
+    assert ObservationLimits(controls=1).controls == 1
+
+    with pytest.raises(ValueError, match="positive integer"):
+        ObservationLimits(context=0)
+    with pytest.raises(ValueError, match="hard ceiling"):
+        ObservationLimits(value=201)
