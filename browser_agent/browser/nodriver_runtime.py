@@ -10,11 +10,13 @@ import hashlib
 import json
 import platform
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
 import nodriver
 from nodriver import cdp
+from nodriver.cdp.dom import BackendNodeId
 from nodriver.core.browser import Browser
 from nodriver.core.config import Config, find_chrome_executable
 
@@ -26,8 +28,13 @@ from .models import (
     BrowserLaunchError,
     BrowserMetadata,
     BrowserShutdownError,
+    ClosedTargetError,
     Observation,
+    OutcomeStatus,
+    StaleTargetError,
 )
+from .nodriver_actions import click, navigate
+from .nodriver_dom import capture_observation
 from .runtime import OwnedBrowser, RuntimeFailure, RuntimeFailureKind
 
 
@@ -62,7 +69,7 @@ class NodriverLauncher:
             async with asyncio.timeout(config.timeouts.launch):
                 await browser.start()
                 await _apply_context_overrides(browser, config)
-            return NodriverOwnedBrowser(browser)
+            return NodriverOwnedBrowser(browser, config)
         except BaseException as error:
             if browser is not None:
                 try:
@@ -79,14 +86,19 @@ class NodriverLauncher:
 class NodriverOwnedBrowser:
     """Isolate exact-version nodriver internals needed for deterministic teardown."""
 
-    def __init__(self, browser: Browser) -> None:
+    def __init__(self, browser: Browser, config: BrowserConfig) -> None:
         process = browser._process
         if process is None or process.pid is None:
             raise BrowserLaunchError("nodriver did not return an owned Chrome process")
         self._browser = browser
+        self._config = config
         self._process = process
         target = cast(Any, browser.main_tab.target)
         self._launch_target_id = str(getattr(target, "target_id", target))
+        self._observation_count = 0
+        self._document_generation = 0
+        self._current_observation_id: str | None = None
+        self._control_index: dict[str, BackendNodeId] = {}
 
     @property
     def process_id(self) -> int:
@@ -97,11 +109,61 @@ class NodriverOwnedBrowser:
         return self._launch_target_id
 
     async def observe(self) -> Observation:
-        raise BrowserEvaluationError("semantic observation is implemented by issue #12")
+        self._require_active_tab()
+        self._observation_count += 1
+        observation_id = f"obs-{self._observation_count}"
+        capture = await capture_observation(
+            self._browser.main_tab,
+            observation_id=observation_id,
+            active_target_id=self._launch_target_id,
+            document_generation=self._document_generation,
+        )
+        self._current_observation_id = observation_id
+        self._control_index = capture.control_index
+        return capture.observation
 
     async def execute(self, action: BrowserAction) -> ActionResult:
-        del action
-        raise BrowserEvaluationError("browser actions are implemented by issue #12")
+        self._require_active_tab()
+        if action.name == "navigate":
+            result = await self._execute_navigate(action)
+        elif action.name == "click":
+            result = await self._execute_click(action)
+        else:
+            raise BrowserEvaluationError(f"unsupported browser action: {action.name!r}")
+        self._require_active_tab()
+        observation = await self.observe()
+        return replace(result, observation=observation)
+
+    async def _execute_navigate(self, action: BrowserAction) -> ActionResult:
+        url = action.arguments.get("url")
+        if not isinstance(url, str):
+            raise ValueError("navigate requires a string 'url' argument")
+        result = await navigate(self._browser.main_tab, self._config, url)
+        if result.status is OutcomeStatus.SUCCEEDED:
+            self._document_generation += 1
+        return result
+
+    async def _execute_click(self, action: BrowserAction) -> ActionResult:
+        target = action.target
+        if target is None:
+            raise ValueError("click requires a target handle")
+        if target.observation_id != self._current_observation_id:
+            raise StaleTargetError(
+                f"target belongs to observation {target.observation_id}; "
+                f"current observation is {self._current_observation_id}"
+            )
+        backend_node_id = self._control_index.get(target.control_id)
+        if backend_node_id is None:
+            raise StaleTargetError(
+                f"unknown control {target.control_id} for observation {target.observation_id}"
+            )
+        return await click(self._browser.main_tab, backend_node_id, self._config.timeouts)
+
+    def _require_active_tab(self) -> None:
+        target = cast(Any, self._browser.main_tab.target)
+        current_id = str(getattr(target, "target_id", target))
+        if current_id != self._launch_target_id:
+            raise ClosedTargetError("the owned tab is no longer the active target")
 
     async def wait_for_failure(self) -> RuntimeFailure:
         process_wait = asyncio.create_task(self._process.wait())
