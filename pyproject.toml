@@ -3,11 +3,20 @@ name = "browser-agent"
 version = "0.1.0"
 description = "A general-purpose browser agent built on Camoufox (Firefox), driven by any model via OpenRouter."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "camoufox[geoip]",
-    "openai>=1.40",
+    "nodriver==0.50.3",
+    "openai>=3.16.2",
     "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.405",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.13.1",
 ]
 
 [project.scripts]
@@ -19,3 +28,26 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["browser_agent"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = [
+    "browser_agent/browser/models.py",
+    "browser_agent/browser/transport.py",
+    "browser_agent/state/adapter.py",
+    "browser_agent/state/artifacts.py",
+    "browser_agent/state/models.py",
+    "tests/fakes.py",
+]

@@ -14,7 +14,10 @@ from .registry import tool
     {
         "index": {"type": "integer", "description": "Element [index] to type into"},
         "text": {"type": "string", "description": "Text to enter"},
-        "submit": {"type": "boolean", "description": "Press Enter afterwards (e.g. to run a search)"},
+        "submit": {
+            "type": "boolean",
+            "description": "Press Enter afterwards (e.g. to run a search)",
+        },
     },
     ["index", "text"],
 )
@@ -57,7 +60,10 @@ def fill_form(browser: BrowserSession, inp: dict[str, Any]) -> str:
     "for OTP fields — it only fills one box.",
     {
         "index": {"type": "integer", "description": "Index of the first OTP digit input"},
-        "code": {"type": "string", "description": 'The full OTP or verification code, e.g. "123456"'},
+        "code": {
+            "type": "string",
+            "description": 'The full OTP or verification code, e.g. "123456"',
+        },
     },
     ["index", "code"],
 )

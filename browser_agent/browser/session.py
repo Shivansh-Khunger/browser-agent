@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import base64
 import re
-from typing import Optional, TypedDict
+from contextlib import suppress
+from typing import TypedDict
 from urllib.parse import urlparse
 
 from camoufox.sync_api import Camoufox
@@ -111,10 +112,8 @@ class BrowserSession:
     def _settle(self) -> None:
         # Best-effort wait for the page to stop moving. networkidle can hang on
         # sites with long-polling, so cap it and move on.
-        try:
+        with suppress(Exception):
             self.page.wait_for_load_state("domcontentloaded", timeout=8000)
-        except Exception:
-            pass
         self.page.wait_for_timeout(400)
 
     def _locator(self, index: int):
@@ -124,7 +123,7 @@ class BrowserSession:
         # aria-ref resolves against that frame's most recent aria_snapshot (which
         # get_state took this turn) back to the exact live element — works for
         # divs, shadow DOM, and cross-origin iframes alike.
-        return t["frame"].locator(f'aria-ref={t["ref"]}')
+        return t["frame"].locator(f"aria-ref={t['ref']}")
 
     def _snapshot_frames(self):
         """The frames worth snapshotting: the main document plus any frame that is
@@ -174,7 +173,13 @@ class BrowserSession:
 
             for n in aria.flatten(aria.parse(snap)):
                 if n["kind"] != "control":  # heading / status text
-                    nodes.append({"kind": n["kind"], "name": n.get("name", ""), "overlay": n.get("overlay", False)})
+                    nodes.append(
+                        {
+                            "kind": n["kind"],
+                            "name": n.get("name", ""),
+                            "overlay": n.get("overlay", False),
+                        }
+                    )
                     continue
                 if len(elements) >= MAX_CONTROLS:
                     continue
@@ -387,7 +392,9 @@ class BrowserSession:
         must interact with — not a passive invisible reCAPTCHA badge."""
         for f in self.page.frames:
             try:
-                text = f.evaluate("() => document.body ? document.body.innerText.slice(0, 2000) : ''")
+                text = f.evaluate(
+                    "() => document.body ? document.body.innerText.slice(0, 2000) : ''"
+                )
                 if self._CAPTCHA_PHRASES.search(text or ""):
                     return True
             except Exception:
@@ -402,12 +409,10 @@ class BrowserSession:
         return False
 
     def screenshot(self, path: str) -> None:
-        try:
+        with suppress(Exception):
             self.page.screenshot(path=path)
-        except Exception:
-            pass
 
-    def screenshot_b64(self) -> Optional[str]:
+    def screenshot_b64(self) -> str | None:
         """Viewport screenshot as a data URL, for sending to a multimodal model.
         JPEG (small) with a PNG fallback; returns None on any failure."""
         try:

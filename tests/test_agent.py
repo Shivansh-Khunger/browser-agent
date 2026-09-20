@@ -28,7 +28,14 @@ def _state(controls, headings=(), url="https://example.com"):
     """Build a PageState the way BrowserSession.get_state does — `nodes` holds the
     same dicts as `elements`, so both views see one index."""
     elements = [
-        {"kind": "control", "index": i, "role": role, "name": name, "text": text, "overlay": overlay}
+        {
+            "kind": "control",
+            "index": i,
+            "role": role,
+            "name": name,
+            "text": text,
+            "overlay": overlay,
+        }
         for i, (role, name, text, overlay) in enumerate(controls)
     ]
     nodes = [{"kind": "heading", "name": h, "overlay": False} for h in headings] + elements
@@ -51,7 +58,10 @@ def test_render_state():
     # Non-overlay controls render in the outline with their index; overlay
     # controls appear only in the banner, never twice.
     mixed = _state(
-        [("button", "Search", 'button "Search"', False), ("button", "Close", 'button "Close"', True)],
+        [
+            ("button", "Search", 'button "Search"', False),
+            ("button", "Close", 'button "Close"', True),
+        ],
         headings=["Results"],
     )
     out = render_state(mixed)
@@ -92,6 +102,7 @@ def test_compact_history():
     the compactor searches for: if SUPERVISOR_INJECT stops containing SUP_MARK,
     the old HTML stops being pruned and the last assertion below fails.
     """
+
     def image(tag):
         return {"role": "user", "content": [{"type": "image_url", "image_url": {"url": tag}}]}
 
@@ -101,7 +112,10 @@ def test_compact_history():
         {"role": "tool", "content": prompts.HTML_PREFIX + "OLD HTML"},
         {"role": "tool", "content": "Clicked [2]" + prompts.PAGE_MARK + "NEW PAGE"},
         image("new.jpg"),
-        {"role": "user", "content": prompts.SUPERVISOR_INJECT.format(advice="scroll", html="SUP HTML")},
+        {
+            "role": "user",
+            "content": prompts.SUPERVISOR_INJECT.format(advice="scroll", html="SUP HTML"),
+        },
     ]
     Agent._compact_history(SimpleNamespace(messages=msgs))
 

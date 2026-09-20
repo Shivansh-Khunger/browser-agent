@@ -35,9 +35,22 @@ _HEAD = re.compile(
 # Roles that are inherently actionable controls (get an index even without a
 # cursor:pointer hint).
 INTERACTIVE = {
-    "button", "link", "textbox", "searchbox", "combobox", "checkbox", "radio",
-    "switch", "tab", "menuitem", "menuitemcheckbox", "menuitemradio", "option",
-    "slider", "spinbutton", "treeitem",
+    "button",
+    "link",
+    "textbox",
+    "searchbox",
+    "combobox",
+    "checkbox",
+    "radio",
+    "switch",
+    "tab",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "slider",
+    "spinbutton",
+    "treeitem",
 }
 # Container roles whose option children we roll up rather than list separately.
 _OPTION_CONTAINERS = {"combobox", "listbox", "menu"}

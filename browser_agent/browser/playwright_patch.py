@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 
 _ORIG = (
-    '        this.addObjectListener(BrowserContext.Events.PageError, (pageError, page) => {\n'
+    "        this.addObjectListener(BrowserContext.Events.PageError, (pageError, page) => {\n"
     '          this._dispatchEvent("pageError", {\n'
     "            error: serializeError(pageError.error),\n"
     "            page: PageDispatcher.from(this, page),\n"
@@ -30,7 +30,7 @@ _ORIG = (
     "        });"
 )
 _FIXED = (
-    '        this.addObjectListener(BrowserContext.Events.PageError, (pageError, page) => {\n'
+    "        this.addObjectListener(BrowserContext.Events.PageError, (pageError, page) => {\n"
     "          try {\n"
     '            this._dispatchEvent("pageError", {\n'
     "              error: serializeError(pageError.error),\n"
@@ -53,7 +53,10 @@ def apply() -> None:
 
         bundle = (
             Path(playwright.__file__).resolve().parent
-            / "driver" / "package" / "lib" / "coreBundle.js"
+            / "driver"
+            / "package"
+            / "lib"
+            / "coreBundle.js"
         )
         text = bundle.read_text(encoding="utf-8")
         if "location: pageError.location ?" in text:

@@ -207,3 +207,21 @@ the tool list. They need no browser and no network:
 ```bash
 for f in tests/test_*.py; do .venv/bin/python "$f" || break; done
 ```
+
+## Development checks
+
+The nodriver cutover targets Python 3.11 or newer and pins `nodriver` exactly.
+The existing workflows still use the synchronous backend while migration tickets
+move them onto the new async contracts.
+
+```bash
+uv lock --check
+uv run ruff format --check browser_agent tests
+uv run ruff check browser_agent tests
+uv run pyright
+uv run pytest tests/test_browser_contract.py tests/test_state_contract.py
+uv run pytest
+```
+
+Pyright currently covers the new browser/state contracts and their deterministic
+fakes. Its scope expands as later migration tickets replace the legacy backend.
