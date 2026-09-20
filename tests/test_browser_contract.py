@@ -50,3 +50,16 @@ async def test_new_observation_invalidates_old_target_handles() -> None:
 
     with pytest.raises(StaleTargetError, match="belongs to observation o1"):
         await session.execute(BrowserAction("click", target=TargetHandle("o1", "control-1")))
+
+
+@pytest.mark.asyncio
+async def test_start_failure_closes_session_and_cannot_retry() -> None:
+    transport = FakeBrowserTransport(start_error=RuntimeError("launch failed"))
+    session = FakeBrowserSession(BrowserConfig(), transport)
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        await session.start()
+
+    assert session.lifecycle is SessionLifecycle.CLOSED
+    with pytest.raises(SessionStateError, match="cannot start from closed"):
+        await session.start()

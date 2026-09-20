@@ -93,3 +93,25 @@ async def test_checkpoint_seals_and_invalidates_episode_before_restore() -> None
     successor = await adapter.restore(checkpoint)
     assert successor.parent_checkpoint_id == checkpoint.checkpoint_id
     assert successor.episode_id != lease.episode_id
+
+
+@pytest.mark.asyncio
+async def test_capture_cannot_finish_after_episode_is_sealed() -> None:
+    adapter = FakeBrowserStateAdapter()
+    lease = await adapter.open_episode(
+        None,
+        CapturePolicy(version="capture-v1", redaction_policy_version="redaction-v1"),
+        EpisodeMetadata(code_revision="abc123", platform="test"),
+    )
+    capture = await adapter.begin_action(
+        lease,
+        ActionRequest(task_id="task-1", action_id="action-1", name="navigate"),
+    )
+    await adapter.checkpoint(lease, "explicit")
+
+    with pytest.raises(LeaseClosedError):
+        await adapter.finish_action(
+            capture,
+            ActionResult(OutcomeStatus.SUCCEEDED, "late"),
+            observation("o2"),
+        )

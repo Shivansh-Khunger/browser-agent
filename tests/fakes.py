@@ -53,11 +53,13 @@ class FakeBrowserTransport:
         *,
         observations: tuple[Observation, ...] = (),
         results: tuple[ActionResult, ...] = (),
+        start_error: BaseException | None = None,
     ) -> None:
         self._active_target_id: str | None = None
         self._observation_id: str | None = None
         self._observations = deque(observations)
         self._results = deque(results)
+        self._start_error = start_error
         self.actions: list[BrowserAction] = []
 
     @property
@@ -65,6 +67,8 @@ class FakeBrowserTransport:
         return self._active_target_id
 
     async def start(self, config: BrowserConfig) -> None:
+        if self._start_error:
+            raise self._start_error
         self._active_target_id = "launch-target"
 
     async def observe(self) -> Observation:
@@ -113,7 +117,13 @@ class FakeBrowserSession:
     async def start(self) -> None:
         if self._lifecycle is not SessionLifecycle.NEW:
             raise SessionStateError(f"cannot start from {self._lifecycle}")
-        await self._transport.start(self._config)
+        try:
+            await self._transport.start(self._config)
+        except BaseException:
+            self._lifecycle = SessionLifecycle.CLOSING
+            await self._transport.close()
+            self._lifecycle = SessionLifecycle.CLOSED
+            raise
         self._lifecycle = SessionLifecycle.RUNNING
 
     def _require_running(self) -> None:
@@ -195,6 +205,10 @@ class FakeBrowserStateAdapter:
         if self._open.get(lease.lease_id) != lease:
             raise LeaseClosedError("episode lease is not open")
 
+    def _require_episode_open(self, episode_id: str) -> None:
+        if not any(lease.episode_id == episode_id for lease in self._open.values()):
+            raise LeaseClosedError("episode is not open")
+
     async def open_episode(
         self,
         seed_checkpoint: CheckpointRef | None,
@@ -218,6 +232,7 @@ class FakeBrowserStateAdapter:
         result: ActionResult,
         observation: Observation | None,
     ) -> StateDelta:
+        self._require_episode_open(capture.episode_id)
         number = self._next_delta
         self._next_delta += 1
         return StateDelta(

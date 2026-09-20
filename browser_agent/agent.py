@@ -15,8 +15,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
-from typing import Any
+from typing import Any, Callable
 
 from openai import OpenAI
 
@@ -45,21 +44,9 @@ AskFn = Callable[[str], str]
 # privacy banners, newsletter/promo interstitials) rather than on-task UI like a
 # cart drawer, location picker, address list, or product-options sheet.
 _DISMISS_HINTS = (
-    "cookie",
-    "consent",
-    "gdpr",
-    "we use cookies",
-    "accept all",
-    "accept cookies",
-    "manage preferences",
-    "privacy policy",
-    "newsletter",
-    "subscribe",
-    "sign up for",
-    "% off your first",
-    "no thanks",
-    "maybe later",
-    "allow all",
+    "cookie", "consent", "gdpr", "we use cookies", "accept all", "accept cookies",
+    "manage preferences", "privacy policy", "newsletter", "subscribe",
+    "sign up for", "% off your first", "no thanks", "maybe later", "allow all",
 )
 # Roles that mean "there is something to type or choose here". aria maps every
 # text-entry element onto one of these (<textarea> -> textbox, <select> ->
@@ -110,9 +97,7 @@ def render_state(state: PageState) -> str:
         else:
             lines.append(f"[{n['index']}] {n['text']}")
     has_control = any(n["kind"] == "control" and not n.get("overlay") for n in state["nodes"])
-    return (
-        out + "Page outline:\n" + ("\n".join(lines) if has_control else "(no interactive elements)")
-    )
+    return out + "Page outline:\n" + ("\n".join(lines) if has_control else "(no interactive elements)")
 
 
 # --- stuck detection -------------------------------------------------------
@@ -155,9 +140,7 @@ def page_signature(state: PageState) -> str:
     )
 
 
-def supervise(
-    client: OpenAI, task: str, recent_actions: list[str], state_text: str
-) -> dict[str, Any]:
+def supervise(client: OpenAI, task: str, recent_actions: list[str], state_text: str) -> dict[str, Any]:
     """A second model that judges whether the browser agent is stuck/looping and,
     if so, returns concrete steering advice."""
     try:
@@ -308,16 +291,10 @@ class Agent:
         msgs = self.messages
 
         def text_indices(predicate):
-            return [
-                i
-                for i, m in enumerate(msgs)
-                if isinstance(m.get("content"), str) and predicate(m["content"])
-            ]
+            return [i for i, m in enumerate(msgs) if isinstance(m.get("content"), str) and predicate(m["content"])]
 
         for i in text_indices(lambda c: prompts.PAGE_MARK in c)[:-1]:
-            msgs[i]["content"] = (
-                msgs[i]["content"].split(prompts.PAGE_MARK, 1)[0] + prompts.PAGE_NOTE
-            )
+            msgs[i]["content"] = msgs[i]["content"].split(prompts.PAGE_MARK, 1)[0] + prompts.PAGE_NOTE
 
         def is_html(c):
             return c.startswith(prompts.HTML_PREFIX) or prompts.SUP_MARK in c
@@ -452,11 +429,7 @@ class Agent:
             if message.content and message.content.strip():
                 print(f"\n💭 {message.content.strip()}")
 
-            calls = [
-                c
-                for c in (message.tool_calls or [])
-                if getattr(c, "type", "function") == "function"
-            ]
+            calls = [c for c in (message.tool_calls or []) if getattr(c, "type", "function") == "function"]
             if not calls:
                 # Model ended without a tool call — treat its text as the result.
                 return (message.content or "").strip() or "(agent stopped without a final answer)"
@@ -485,11 +458,7 @@ class Agent:
                 target = self._confirm_target(name, inp, elements)
                 if target and f"{name}:{target.lower()}" not in confirmed:
                     print(f"\n🛑 Consequential action detected: {target}")
-                    if re.match(
-                        r"\s*(y|yes|ok|sure|proceed|confirm|go)\b",
-                        ask(prompts.CONFIRM_ASK.format(label=target)),
-                        re.I,
-                    ):
+                    if re.match(r"\s*(y|yes|ok|sure|proceed|confirm|go)\b", ask(prompts.CONFIRM_ASK.format(label=target)), re.I):
                         confirmed.add(f"{name}:{target.lower()}")
                     else:
                         self._reply(call, prompts.CONFIRM_DECLINED.format(label=target))
@@ -516,12 +485,7 @@ class Agent:
                     state_text, elements = render_state(state), state["elements"]
                     sig = page_signature(state)
                     stuck, stuck_repeats = repeat_guard_step(
-                        action_sig,
-                        sig,
-                        last_action_sig,
-                        last_state_sig,
-                        state_sigs[-5:],
-                        stuck_repeats,
+                        action_sig, sig, last_action_sig, last_state_sig, state_sigs[-5:], stuck_repeats
                     )
                     last_action_sig, last_state_sig = action_sig, sig
                     if stuck and not refusing:
@@ -534,12 +498,9 @@ class Agent:
             if acted:
                 due = step % CHECK_EVERY == 0
                 suspect = looks_like_loop(actions) or looks_stalled(state_sigs)
-                if (
-                    (due or suspect)
-                    and step - last_steer >= 2
-                    and self._maybe_steer(task, actions, state_text)
-                ):
-                    last_steer = step
+                if (due or suspect) and step - last_steer >= 2:
+                    if self._maybe_steer(task, actions, state_text):
+                        last_steer = step
 
         return f"Reached the step limit ({MAX_STEPS}) without finishing."
 
