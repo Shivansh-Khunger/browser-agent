@@ -14,10 +14,12 @@ from browser_agent.browser.models import (
     StaleTargetError,
     Viewport,
 )
+from browser_agent.browser.transport import BrowserTransport
 from browser_agent.state.models import (
     ActionCapture,
     ActionRequest,
     ArtifactKind,
+    ArtifactNotFoundError,
     ArtifactRef,
     CapturePolicy,
     CheckpointRef,
@@ -25,6 +27,7 @@ from browser_agent.state.models import (
     EpisodeLease,
     EpisodeMetadata,
     EpisodeOutcome,
+    LeaseClosedError,
     SecurityClass,
     StateDelta,
 )
@@ -47,13 +50,10 @@ class FakeBrowserTransport:
 
     def __init__(
         self,
-        config: BrowserConfig,
         *,
         observations: tuple[Observation, ...] = (),
         results: tuple[ActionResult, ...] = (),
     ) -> None:
-        self._config = config
-        self._lifecycle = SessionLifecycle.NEW
         self._active_target_id: str | None = None
         self._observation_id: str | None = None
         self._observations = deque(observations)
@@ -61,29 +61,13 @@ class FakeBrowserTransport:
         self.actions: list[BrowserAction] = []
 
     @property
-    def config(self) -> BrowserConfig:
-        return self._config
-
-    @property
-    def lifecycle(self) -> SessionLifecycle:
-        return self._lifecycle
-
-    @property
     def active_target_id(self) -> str | None:
         return self._active_target_id
 
-    async def start(self) -> None:
-        if self._lifecycle is not SessionLifecycle.NEW:
-            raise SessionStateError(f"cannot start from {self._lifecycle}")
-        self._lifecycle = SessionLifecycle.RUNNING
+    async def start(self, config: BrowserConfig) -> None:
         self._active_target_id = "launch-target"
 
-    def _require_running(self) -> None:
-        if self._lifecycle is not SessionLifecycle.RUNNING:
-            raise SessionStateError(f"session is {self._lifecycle}")
-
     async def observe(self) -> Observation:
-        self._require_running()
         if not self._observations:
             raise AssertionError("no fake observation queued")
         observation = self._observations.popleft()
@@ -92,7 +76,6 @@ class FakeBrowserTransport:
         return observation
 
     async def execute(self, action: BrowserAction) -> ActionResult:
-        self._require_running()
         if action.target and action.target.observation_id != self._observation_id:
             raise StaleTargetError(
                 f"target belongs to observation {action.target.observation_id}; "
@@ -104,10 +87,52 @@ class FakeBrowserTransport:
         return ActionResult(OutcomeStatus.SUCCEEDED, f"{action.name} completed")
 
     async def close(self) -> None:
+        self._active_target_id = None
+
+
+class FakeBrowserSession:
+    """Public session fake that exercises an injected browser transport."""
+
+    def __init__(self, config: BrowserConfig, transport: BrowserTransport) -> None:
+        self._config = config
+        self._transport = transport
+        self._lifecycle = SessionLifecycle.NEW
+
+    @property
+    def config(self) -> BrowserConfig:
+        return self._config
+
+    @property
+    def lifecycle(self) -> SessionLifecycle:
+        return self._lifecycle
+
+    @property
+    def active_target_id(self) -> str | None:
+        return self._transport.active_target_id
+
+    async def start(self) -> None:
+        if self._lifecycle is not SessionLifecycle.NEW:
+            raise SessionStateError(f"cannot start from {self._lifecycle}")
+        await self._transport.start(self._config)
+        self._lifecycle = SessionLifecycle.RUNNING
+
+    def _require_running(self) -> None:
+        if self._lifecycle is not SessionLifecycle.RUNNING:
+            raise SessionStateError(f"session is {self._lifecycle}")
+
+    async def observe(self) -> Observation:
+        self._require_running()
+        return await self._transport.observe()
+
+    async def execute(self, action: BrowserAction) -> ActionResult:
+        self._require_running()
+        return await self._transport.execute(action)
+
+    async def close(self) -> None:
         if self._lifecycle is SessionLifecycle.CLOSED:
             return
         self._lifecycle = SessionLifecycle.CLOSING
-        self._active_target_id = None
+        await self._transport.close()
         self._lifecycle = SessionLifecycle.CLOSED
 
 
@@ -141,7 +166,10 @@ class FakeArtifactStore:
         )
 
     async def get(self, reference: ArtifactRef) -> bytes:
-        return self._objects[reference.content_id]
+        try:
+            return self._objects[reference.content_id]
+        except KeyError as error:
+            raise ArtifactNotFoundError(reference.content_id) from error
 
 
 class FakeBrowserStateAdapter:
@@ -165,7 +193,7 @@ class FakeBrowserStateAdapter:
 
     def _require_open(self, lease: EpisodeLease) -> None:
         if self._open.get(lease.lease_id) != lease:
-            raise ValueError("episode lease is not open")
+            raise LeaseClosedError("episode lease is not open")
 
     async def open_episode(
         self,
@@ -204,7 +232,9 @@ class FakeBrowserStateAdapter:
 
     async def checkpoint(self, lease: EpisodeLease, reason: str) -> CheckpointRef:
         self._require_open(lease)
-        return self._checkpoint(lease, reason)
+        checkpoint = self._checkpoint(lease, reason)
+        del self._open[lease.lease_id]
+        return checkpoint
 
     def _checkpoint(self, lease: EpisodeLease, reason: str) -> CheckpointRef:
         number = self._next_checkpoint

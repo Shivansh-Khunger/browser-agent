@@ -20,6 +20,8 @@ from .models import (
 
 @runtime_checkable
 class BrowserStateAdapter(Protocol):
+    """Own episode state; checkpoint invalidates its lease before returning."""
+
     async def open_episode(
         self,
         seed_checkpoint: CheckpointRef | None,

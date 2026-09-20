@@ -4,27 +4,15 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from .models import (
-    ActionResult,
-    BrowserAction,
-    BrowserConfig,
-    Observation,
-    SessionLifecycle,
-)
+from .models import ActionResult, BrowserAction, BrowserConfig, Observation
 
 
 @runtime_checkable
 class BrowserTransport(Protocol):
     @property
-    def config(self) -> BrowserConfig: ...
-
-    @property
-    def lifecycle(self) -> SessionLifecycle: ...
-
-    @property
     def active_target_id(self) -> str | None: ...
 
-    async def start(self) -> None: ...
+    async def start(self, config: BrowserConfig) -> None: ...
 
     async def observe(self) -> Observation: ...
 

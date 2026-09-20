@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from browser_agent.browser import BrowserSession
 from browser_agent.browser.models import (
     ActionResult,
     BrowserAction,
@@ -12,15 +13,15 @@ from browser_agent.browser.models import (
     StaleTargetError,
     TargetHandle,
 )
-from browser_agent.browser.transport import BrowserTransport
-from tests.fakes import FakeBrowserTransport, observation
+from tests.fakes import FakeBrowserSession, FakeBrowserTransport, observation
 
 
 @pytest.mark.asyncio
 async def test_browser_session_has_one_way_lifecycle_and_structured_results() -> None:
-    session = FakeBrowserTransport(BrowserConfig())
+    transport = FakeBrowserTransport()
+    session = FakeBrowserSession(BrowserConfig(), transport)
 
-    assert isinstance(session, BrowserTransport)
+    assert isinstance(session, BrowserSession)
 
     assert session.lifecycle is SessionLifecycle.NEW
 
@@ -41,9 +42,8 @@ async def test_browser_session_has_one_way_lifecycle_and_structured_results() ->
 
 @pytest.mark.asyncio
 async def test_new_observation_invalidates_old_target_handles() -> None:
-    session = FakeBrowserTransport(
-        BrowserConfig(), observations=(observation("o1"), observation("o2"))
-    )
+    transport = FakeBrowserTransport(observations=(observation("o1"), observation("o2")))
+    session = FakeBrowserSession(BrowserConfig(), transport)
     await session.start()
     await session.observe()
     await session.observe()

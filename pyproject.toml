@@ -44,6 +44,7 @@ ignore = ["E501"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
 include = [
+    "browser_agent/browser/interface.py",
     "browser_agent/browser/models.py",
     "browser_agent/browser/transport.py",
     "browser_agent/state/adapter.py",

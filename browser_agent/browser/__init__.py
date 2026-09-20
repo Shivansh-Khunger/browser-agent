@@ -1,15 +1,16 @@
-"""Public browser models and async transport seam.
+"""Public browser-session interface and backend-neutral models.
 
-- `session.py` — `BrowserSession`, the one object the tools act through.
+- `interface.py` — async `BrowserSession` contract used by new code.
+- `session.py` — legacy synchronous implementation retained during cutover.
 - `aria.py` — parses the `aria_snapshot` text into the nodes the model sees.
 - `dom.py` — the few JS snippets that must run inside the page.
 - `playwright_patch.py` — a driver bug workaround, applied on launch.
 
-Deliberately no imports here: `from browser_agent.browser import aria` then costs
-nothing, so the pure parser stays testable without a browser installed. Callers
-name the module they want — `from .browser.session import BrowserSession`.
+Nodriver transport remains internal. Callers depend on package exports, never
+transport or backend identities.
 """
 
+from .interface import BrowserSession
 from .models import (
     ActionResult,
     BrowserAction,
@@ -32,7 +33,6 @@ from .models import (
     UnsupportedRegion,
     Viewport,
 )
-from .transport import BrowserTransport
 
 __all__ = [
     "ActionResult",
@@ -42,7 +42,7 @@ __all__ = [
     "BrowserEvaluationError",
     "BrowserLaunchError",
     "BrowserTimeoutError",
-    "BrowserTransport",
+    "BrowserSession",
     "ClosedTargetError",
     "ContextNode",
     "Observation",

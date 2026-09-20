@@ -35,6 +35,27 @@ class EpisodeOutcome(StrEnum):
     ABORTED = "aborted"
 
 
+class StateAdapterError(Exception):
+    """Typed failure at browser-state boundary."""
+
+    code = "state_adapter_error"
+    retryable = False
+    fatal = False
+
+
+class LeaseClosedError(StateAdapterError):
+    code = "lease_closed"
+
+
+class ArtifactNotFoundError(StateAdapterError):
+    code = "artifact_not_found"
+
+
+class CheckpointError(StateAdapterError):
+    code = "checkpoint_failed"
+    fatal = True
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactRef:
     content_id: str

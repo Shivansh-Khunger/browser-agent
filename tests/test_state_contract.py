@@ -11,6 +11,7 @@ from browser_agent.state.models import (
     CapturePolicy,
     EpisodeMetadata,
     EpisodeOutcome,
+    LeaseClosedError,
     SecurityClass,
 )
 from tests.fakes import FakeArtifactStore, FakeBrowserStateAdapter, observation
@@ -70,3 +71,25 @@ async def test_state_adapter_records_action_and_returns_terminal_checkpoint() ->
     assert checkpoint.parent_id is None
     assert checkpoint.clean_shutdown is True
     assert not hasattr(lease, "profile_path")
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_seals_and_invalidates_episode_before_restore() -> None:
+    adapter = FakeBrowserStateAdapter()
+    lease = await adapter.open_episode(
+        None,
+        CapturePolicy(version="capture-v1", redaction_policy_version="redaction-v1"),
+        EpisodeMetadata(code_revision="abc123", platform="test"),
+    )
+
+    checkpoint = await adapter.checkpoint(lease, "explicit")
+
+    with pytest.raises(LeaseClosedError):
+        await adapter.begin_action(
+            lease,
+            ActionRequest(task_id="task-1", action_id="action-2", name="click"),
+        )
+
+    successor = await adapter.restore(checkpoint)
+    assert successor.parent_checkpoint_id == checkpoint.checkpoint_id
+    assert successor.episode_id != lease.episode_id

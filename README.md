@@ -116,12 +116,16 @@ browser_agent/
     forms.py             type, fill_form, type_otp, select_option
     read.py              read_page, get_html (read-only: no state refresh after)
     meta.py              done, ask_user, remember, forget (the loop handles these)
-  browser/             everything that knows Playwright's and Camoufox's shapes
-    session.py           BrowserSession: the one object the tools act through
+  browser/             browser boundary and legacy backend during cutover
+    interface.py         public async BrowserSession contract
+    models.py            observations, actions, outcomes, errors, and config
+    transport.py         internal browser transport seam
+    session.py           legacy synchronous implementation
     aria.py              parses aria_snapshot into the indexed nodes the model sees
     dom.py               the few JS snippets that must run inside the page
     playwright_patch.py  stops a malformed page error crashing the Firefox driver
-tests/                 plain-assert self-checks, no framework, no browser needed
+  state/               browser profile, capture, and artifact contracts
+tests/                 pytest suites; contract tests need no browser or network
   test_aria.py           the snapshot parser
   test_agent.py          page rendering, stuck detection, history compaction
   test_tools.py          the registry's invariants
@@ -183,7 +187,7 @@ Where new code goes:
 | A configuration knob | `config.py`, plus a line in `.env.example`. No `os.environ` anywhere else. |
 | Playwright / Camoufox code | `browser/`. Nothing outside that package imports either library. |
 | A pure helper | Beside its only caller. Move it down a layer when a second caller appears. |
-| A test | `tests/test_<area>.py`, plain asserts under `__main__`, no framework. |
+| A test | `tests/test_<area>.py`, using pytest and pytest-asyncio at public seams. |
 
 A new tool is a schema and a body in one place:
 
@@ -201,11 +205,11 @@ guards, `browser/session.py` into perception and actions.
 
 Good candidates for a first tool: file downloads and tab management.
 
-Run the self-checks after touching perception, rendering, history compaction, or
+Run focused tests after touching perception, rendering, history compaction, or
 the tool list. They need no browser and no network:
 
 ```bash
-for f in tests/test_*.py; do .venv/bin/python "$f" || break; done
+uv run pytest tests/test_aria.py tests/test_agent.py tests/test_tools.py
 ```
 
 ## Development checks
@@ -219,7 +223,7 @@ uv lock --check
 uv run ruff format --check browser_agent tests
 uv run ruff check browser_agent tests
 uv run pyright
-uv run pytest tests/test_browser_contract.py tests/test_state_contract.py
+uv run pytest tests/test_models.py tests/test_browser_contract.py tests/test_state_contract.py
 uv run pytest
 ```
 
