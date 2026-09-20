@@ -64,6 +64,30 @@ def test_contract_values_are_validated_and_immutable() -> None:
         TimeoutConfig(launch=0)
 
 
+def test_observation_rejects_mismatched_screenshot_target_or_viewport() -> None:
+    viewport = Viewport(1280, 900)
+    common = {
+        "observation_id": "o1",
+        "active_target_id": "target-1",
+        "url": "https://example.test",
+        "title": "Example",
+        "document_generation": 1,
+        "frame_generations": {"main": 1},
+        "viewport": viewport,
+    }
+
+    with pytest.raises(ValueError, match="another browser target"):
+        Observation(
+            **common,
+            screenshot=ScreenshotMetadata("shot-1", "o1", "target-2", viewport),
+        )
+    with pytest.raises(ValueError, match="viewport differs"):
+        Observation(
+            **common,
+            screenshot=ScreenshotMetadata("shot-1", "o1", "target-1", Viewport(640, 480)),
+        )
+
+
 def test_observation_limits_enforce_positive_hard_ceilings() -> None:
     assert ObservationLimits(controls=1).controls == 1
 

@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import math
+import struct
+from base64 import b64decode
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 
 from nodriver import cdp
 from nodriver.cdp.accessibility import AXNode, AXNodeId
@@ -20,6 +23,7 @@ from .models import (
     ContextNode,
     Observation,
     ObservationLimits,
+    ScreenshotMetadata,
     SemanticControl,
     TargetHandle,
     UnsupportedRegion,
@@ -83,19 +87,32 @@ async def capture_observation(
 ) -> ObservationCapture:
     limits = limits or ObservationLimits()
     target_info = await tab.send(cdp.target.get_target_info())
-    layout_viewport, visual_viewport, *_ = await tab.send(cdp.page.get_layout_metrics())
-    viewport = Viewport(
-        width=float(layout_viewport.client_width),
-        height=float(layout_viewport.client_height),
-        device_scale=visual_viewport.zoom or 1.0,
-        offset_x=float(visual_viewport.offset_x),
-        offset_y=float(visual_viewport.offset_y),
-        scale=visual_viewport.scale,
-        scroll_x=float(layout_viewport.page_x),
-        scroll_y=float(layout_viewport.page_y),
-    )
+    viewport = await read_viewport(tab)
+
     state = _BuildState(observation_id, limits, viewport)
     await _capture_frame(frame_root, state, offset=(0.0, 0.0), main=True)
+    screenshot: ScreenshotMetadata | None = None
+    warnings: tuple[str, ...] = ()
+    try:
+        screenshot_data = await tab.send(
+            cdp.page.capture_screenshot(
+                format_="png", from_surface=True, capture_beyond_viewport=False
+            )
+        )
+        screenshot_bytes = b64decode(screenshot_data, validate=True)
+        pixel_width, pixel_height = _png_dimensions(screenshot_bytes)
+    except Exception:
+        warnings = ("screenshot_capture_failed",)
+    else:
+        digest = sha256(screenshot_bytes).hexdigest()[:24]
+        screenshot = ScreenshotMetadata(
+            f"shot-{digest}",
+            observation_id,
+            active_target_id,
+            viewport,
+            pixel_width,
+            pixel_height,
+        )
     selected_controls = sorted(
         sorted(state.controls, key=_retention_key)[: limits.controls], key=lambda item: item.order
     )
@@ -134,10 +151,32 @@ async def capture_observation(
         controls=tuple(materialized),
         context=tuple(item.node for item in selected_context),
         unsupported_regions=tuple(state.unsupported[: limits.context]),
+        screenshot=screenshot,
+        warnings=warnings,
         truncated=bool(omitted) or content_truncated,
         omitted_counts=omitted,
     )
     return ObservationCapture(observation, control_index)
+
+
+async def read_viewport(tab: Tab) -> Viewport:
+    layout_viewport, visual_viewport, *_ = await tab.send(cdp.page.get_layout_metrics())
+    return Viewport(
+        width=float(layout_viewport.client_width),
+        height=float(layout_viewport.client_height),
+        device_scale=visual_viewport.zoom or 1.0,
+        offset_x=float(visual_viewport.offset_x),
+        offset_y=float(visual_viewport.offset_y),
+        scale=visual_viewport.scale,
+        scroll_x=float(layout_viewport.page_x),
+        scroll_y=float(layout_viewport.page_y),
+    )
+
+
+def _png_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("screenshot is not a PNG image")
+    return struct.unpack(">II", data[16:24])
 
 
 async def _capture_frame(
@@ -195,6 +234,21 @@ async def _capture_frame(
     async def visit(ax_node: AXNode, priority_ancestor: bool = False) -> None:
         backend_id = ax_node.backend_dom_node_id
         dom_node = dom_by_backend_id.get(backend_id) if backend_id else None
+        role = semantics.ax_text(ax_node.role).casefold()
+        properties = semantics.properties(ax_node)
+        if (
+            dom_node
+            and dom_node.node_name.casefold() in {"canvas", "video"}
+            and not semantics.is_control(role, dom_node, properties)
+        ):
+            state.unsupported.append(
+                UnsupportedRegion(
+                    reason="pixel_only",
+                    frame_breadcrumb=frame.breadcrumb,
+                    origin=frame.origin,
+                    bounds=_translate(await _bounds(frame.session, backend_id), offset),
+                )
+            )
         if not ax_node.ignored:
             state.order += 1
             await _collect_node(

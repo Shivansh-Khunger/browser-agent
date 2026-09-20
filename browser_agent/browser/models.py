@@ -129,6 +129,8 @@ class ScreenshotMetadata:
     observation_id: str
     active_target_id: str
     viewport: Viewport
+    pixel_width: int | None = None
+    pixel_height: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +203,10 @@ class Observation:
                 raise ValueError("control handle belongs to another observation")
         if self.screenshot and self.screenshot.observation_id != self.observation_id:
             raise ValueError("screenshot belongs to another observation")
+        if self.screenshot and self.screenshot.active_target_id != self.active_target_id:
+            raise ValueError("screenshot belongs to another browser target")
+        if self.screenshot and self.screenshot.viewport != self.viewport:
+            raise ValueError("screenshot viewport differs from observation viewport")
 
 
 @dataclass(frozen=True, slots=True)

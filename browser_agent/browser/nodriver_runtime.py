@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import platform
 from contextlib import suppress
 from dataclasses import replace
@@ -29,11 +30,12 @@ from .models import (
     BrowserShutdownError,
     ClosedTargetError,
     Observation,
+    ScreenshotMetadata,
     StaleTargetError,
 )
-from .nodriver_actions import click, navigate
-from .nodriver_dom import ControlTarget, capture_observation
-from .nodriver_frames import FrameRegistry, find_frame
+from .nodriver_actions import click, click_at, navigate
+from .nodriver_dom import ControlTarget, capture_observation, read_viewport
+from .nodriver_frames import FrameRegistry, find_frame, frame_generations
 from .runtime import OwnedBrowser, RuntimeFailure, RuntimeFailureKind
 
 
@@ -95,6 +97,8 @@ class NodriverOwnedBrowser:
         self._launch_target_id = _target_id(browser)
         self._observation_count = 0
         self._current_observation_id: str | None = None
+        self._current_screenshot: ScreenshotMetadata | None = None
+        self._current_frame_generations: dict[str, int] = {}
         self._control_index: dict[str, ControlTarget] = {}
         self._frames = FrameRegistry(browser.main_tab)
 
@@ -119,6 +123,8 @@ class NodriverOwnedBrowser:
             limits=self._config.observation_limits,
         )
         self._current_observation_id = observation_id
+        self._current_screenshot = capture.observation.screenshot
+        self._current_frame_generations = dict(capture.observation.frame_generations)
         self._control_index = capture.control_index
         return capture.observation
 
@@ -128,6 +134,8 @@ class NodriverOwnedBrowser:
             result = await self._execute_navigate(action)
         elif action.name == "click":
             result = await self._execute_click(action)
+        elif action.name == "click_at":
+            result = await self._execute_click_at(action)
         else:
             raise BrowserEvaluationError(f"unsupported browser action: {action.name!r}")
         self._require_active_tab()
@@ -155,7 +163,13 @@ class NodriverOwnedBrowser:
             raise StaleTargetError(
                 f"unknown control {target.control_id} for observation {target.observation_id}"
             )
-        current_frame = find_frame(await self._frames.reconcile(), control_target.frame_id)
+        current_root = await self._frames.reconcile()
+        if frame_generations(current_root) != self._current_frame_generations:
+            raise StaleTargetError(
+                f"control {target.control_id} belongs to stale frame documents; "
+                "take a fresh observation"
+            )
+        current_frame = find_frame(current_root, control_target.frame_id)
         if (
             current_frame is None
             or current_frame.session is not control_target.session
@@ -170,6 +184,33 @@ class NodriverOwnedBrowser:
             control_target.backend_node_id,
             self._config.timeouts,
         )
+
+    async def _execute_click_at(self, action: BrowserAction) -> ActionResult:
+        observation_id = action.arguments.get("observation_id")
+        screenshot_id = action.arguments.get("screenshot_id")
+        if observation_id != self._current_observation_id:
+            raise StaleTargetError(
+                f"coordinate target belongs to observation {observation_id!r}; "
+                f"current observation is {self._current_observation_id!r}"
+            )
+        screenshot = self._current_screenshot
+        if screenshot is None or screenshot_id != screenshot.screenshot_id:
+            raise StaleTargetError("screenshot is missing, mismatched, or stale")
+        if screenshot.active_target_id != self._launch_target_id:
+            raise StaleTargetError("screenshot belongs to a stale browser target")
+        if frame_generations(await self._frames.reconcile()) != self._current_frame_generations:
+            raise StaleTargetError("screenshot belongs to stale frame documents")
+        if await read_viewport(self._browser.main_tab) != screenshot.viewport:
+            raise StaleTargetError("screenshot viewport changed; take a fresh observation")
+        x = _finite_coordinate(action.arguments.get("x"), "x")
+        y = _finite_coordinate(action.arguments.get("y"), "y")
+        width = float(screenshot.pixel_width or screenshot.viewport.width)
+        height = float(screenshot.pixel_height or screenshot.viewport.height)
+        if not (0 <= x < width and 0 <= y < height):
+            raise ValueError("click_at coordinates must be inside the screenshot viewport")
+        css_x = x * screenshot.viewport.width / width
+        css_y = y * screenshot.viewport.height / height
+        return await click_at(self._browser.main_tab, css_x, css_y, self._config.timeouts)
 
     def _require_active_tab(self) -> None:
         if _target_id(self._browser) != self._launch_target_id:
@@ -225,6 +266,15 @@ class NodriverOwnedBrowser:
 def _target_id(browser: Browser) -> str:
     target = cast(Any, browser.main_tab.target)
     return str(getattr(target, "target_id", target))
+
+
+def _finite_coordinate(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"click_at {name} coordinate must be a finite number")
+    coordinate = float(value)
+    if not math.isfinite(coordinate):
+        raise ValueError(f"click_at {name} coordinate must be a finite number")
+    return coordinate
 
 
 def _resolve_executable(configured: Path | None) -> Path:

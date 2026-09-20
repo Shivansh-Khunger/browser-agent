@@ -197,6 +197,13 @@ def find_frame(root: FrameContext, frame_id: str) -> FrameContext | None:
     return None
 
 
+def frame_generations(root: FrameContext) -> dict[str, int]:
+    generations = {str(root.frame_id): root.document_generation}
+    for child in root.children:
+        generations.update(frame_generations(child))
+    return generations
+
+
 def _safe_origin(url: str) -> str | None:
     parsed = urlsplit(url)
     if not parsed.scheme or not parsed.hostname:

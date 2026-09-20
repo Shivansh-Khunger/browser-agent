@@ -6,7 +6,12 @@ import pytest
 from nodriver import cdp
 from nodriver.core.tab import Tab
 
-from browser_agent.browser.nodriver_frames import FrameContext, FrameRegistry, _safe_origin
+from browser_agent.browser.nodriver_frames import (
+    FrameContext,
+    FrameRegistry,
+    _safe_origin,
+    frame_generations,
+)
 
 
 def test_safe_origin_removes_credentials_path_query_and_fragment() -> None:
@@ -47,6 +52,7 @@ def test_breadcrumb_rebase_updates_synthetic_descendants() -> None:
 
     assert rebased.breadcrumb == ("main", "checkout")
     assert rebased.children[0].breadcrumb == ("main", "checkout", "frame-1")
+    assert frame_generations(rebased) == {"child": 1, "grandchild": 1}
 
 
 class _ClosingSession:

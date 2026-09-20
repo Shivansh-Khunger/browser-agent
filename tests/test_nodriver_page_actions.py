@@ -52,6 +52,8 @@ _FIXTURE_HTML = """<!doctype html>
 <label>Account password <input type="password" value="password-canary"></label>
 <label>Verification code <input name="otp" value="otp-canary" autofocus></label>
 <section aria-label="Open shadow host" id="shadow"></section>
+<canvas aria-label="Pixel-only chart" width="40" height="20"
+        onclick="document.getElementById('out').textContent = 'canvas clicked'"></canvas>
 <script>
   const root = document.getElementById('shadow').attachShadow({mode: 'open'});
   root.innerHTML = '<button>Shadow action</button>';
@@ -219,6 +221,100 @@ async def test_click_lands_on_control_when_hit_test_resolves_a_child_element(tmp
             assert click_result.status is OutcomeStatus.SUCCEEDED
             assert click_result.observation is not None
             assert _status_text(click_result.observation) == "nested clicked"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_click_at_requires_current_bounded_screenshot_coordinates(tmp_path) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    state = LocalBrowserStateAdapter(tmp_path / "state", store)
+    session = NodriverSession(
+        BrowserConfig(headless=True, timeouts=TimeoutConfig(navigation=10.0, settle=0.1)),
+        state,
+        _policy(),
+        _episode_metadata(),
+    )
+    try:
+        await session.start()
+    except Exception as error:
+        if "No installed Chrome or Chromium" in str(error):
+            pytest.skip(str(error))
+        raise
+
+    try:
+        with _local_fixture_server(tmp_path / "site") as url:
+            result = await session.execute(BrowserAction("navigate", {"url": url}))
+            assert result.observation is not None
+            observation = result.observation
+            screenshot = observation.screenshot
+            assert screenshot is not None
+            assert screenshot.observation_id == observation.observation_id
+            assert screenshot.active_target_id == observation.active_target_id
+            assert screenshot.viewport == observation.viewport
+            assert screenshot.pixel_width is not None and screenshot.pixel_width > 0
+            assert screenshot.pixel_height is not None and screenshot.pixel_height > 0
+            pixel_region = next(
+                region
+                for region in observation.unsupported_regions
+                if region.reason == "pixel_only"
+            )
+            assert pixel_region.bounds is not None
+
+            arguments = {
+                "observation_id": observation.observation_id,
+                "screenshot_id": screenshot.screenshot_id,
+                "x": 1.0,
+                "y": 1.0,
+            }
+            with pytest.raises(StaleTargetError, match="belongs to observation"):
+                await session.execute(
+                    BrowserAction("click_at", {**arguments, "observation_id": "stale"})
+                )
+            with pytest.raises(StaleTargetError, match="mismatched, or stale"):
+                await session.execute(
+                    BrowserAction("click_at", {**arguments, "screenshot_id": "stale"})
+                )
+            with pytest.raises(ValueError, match="finite number"):
+                await session.execute(BrowserAction("click_at", {**arguments, "x": float("nan")}))
+            with pytest.raises(ValueError, match="inside the screenshot viewport"):
+                await session.execute(
+                    BrowserAction("click_at", {**arguments, "x": screenshot.pixel_width})
+                )
+
+            assert pixel_region.bounds is not None
+            left, top, right, bottom = pixel_region.bounds
+            clicked = await session.execute(
+                BrowserAction(
+                    "click_at",
+                    {
+                        **arguments,
+                        "x": (left + right)
+                        / 2
+                        * screenshot.pixel_width
+                        / screenshot.viewport.width,
+                        "y": (top + bottom)
+                        / 2
+                        * screenshot.pixel_height
+                        / screenshot.viewport.height,
+                    },
+                )
+            )
+            assert clicked.observation is not None
+            assert _status_text(clicked.observation) == "canvas clicked"
+
+            refreshed_button = _control_named(clicked.observation, "Click me")
+            runtime = session._runtime
+            assert runtime is not None
+            await runtime._browser.main_tab.send(  # pyright: ignore[reportPrivateUsage]
+                cdp.runtime.evaluate(
+                    """const blocker = document.createElement('div');
+                    blocker.style = 'position:fixed;inset:0;z-index:9999';
+                    document.body.appendChild(blocker);"""
+                )
+            )
+            with pytest.raises(StaleTargetError, match="obstructed or moved"):
+                await session.execute(BrowserAction("click", target=refreshed_button.handle))
     finally:
         await session.close()
 

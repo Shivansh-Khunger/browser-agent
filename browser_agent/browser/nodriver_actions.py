@@ -92,6 +92,17 @@ async def click(tab: Tab, backend_node_id: BackendNodeId, timeouts: TimeoutConfi
             "control was obstructed or moved before the click could be dispatched"
         )
 
+    await _dispatch_click(tab, x, y, timeouts)
+    return ActionResult(OutcomeStatus.SUCCEEDED, "click completed")
+
+
+async def click_at(tab: Tab, x: float, y: float, timeouts: TimeoutConfig) -> ActionResult:
+    """Dispatch a validated coordinate click in top-level viewport space."""
+    await _dispatch_click(tab, x, y, timeouts)
+    return ActionResult(OutcomeStatus.SUCCEEDED, "coordinate click completed")
+
+
+async def _dispatch_click(tab: Tab, x: float, y: float, timeouts: TimeoutConfig) -> None:
     for event_type in ("mousePressed", "mouseReleased"):
         await tab.send(
             cdp.input_.dispatch_mouse_event(
@@ -104,7 +115,6 @@ async def click(tab: Tab, backend_node_id: BackendNodeId, timeouts: TimeoutConfi
             )
         )
     await asyncio.sleep(timeouts.settle)
-    return ActionResult(OutcomeStatus.SUCCEEDED, "click completed")
 
 
 def _subtree_backend_ids(node: Node) -> set[BackendNodeId]:
