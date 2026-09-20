@@ -11,13 +11,13 @@ from browser_agent.state.models import (
     ArtifactRef,
     CapturePolicy,
     CheckpointError,
-    CleanShutdownProof,
     EpisodeMetadata,
     EpisodeOutcome,
     LeaseClosedError,
     RestrictedStorageError,
     SecurityClass,
 )
+from tests.fakes import clean_shutdown
 
 
 class _FailingManifestStore:
@@ -47,10 +47,6 @@ class _FailingManifestStore:
 
     async def get(self, reference: ArtifactRef) -> bytes:
         return await self._backing.get(reference)
-
-
-def clean_shutdown(episode_id: str) -> CleanShutdownProof:
-    return CleanShutdownProof(episode_id=episode_id, process_id=4242, exit_code=0)
 
 
 @pytest.mark.asyncio

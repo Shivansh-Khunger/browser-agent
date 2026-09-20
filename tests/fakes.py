@@ -46,6 +46,10 @@ def observation(observation_id: str) -> Observation:
     )
 
 
+def clean_shutdown(episode_id: str) -> CleanShutdownProof:
+    return CleanShutdownProof(episode_id=episode_id, process_id=4242, exit_code=0)
+
+
 class FakeBrowserTransport:
     """Deterministic executable transport for browser contract tests."""
 

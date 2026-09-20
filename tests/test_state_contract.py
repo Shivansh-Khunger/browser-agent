@@ -9,17 +9,12 @@ from browser_agent.state.models import (
     ActionRequest,
     ArtifactKind,
     CapturePolicy,
-    CleanShutdownProof,
     EpisodeMetadata,
     EpisodeOutcome,
     LeaseClosedError,
     SecurityClass,
 )
-from tests.fakes import FakeArtifactStore, FakeBrowserStateAdapter, observation
-
-
-def clean_shutdown(episode_id: str) -> CleanShutdownProof:
-    return CleanShutdownProof(episode_id=episode_id, process_id=4242, exit_code=0)
+from tests.fakes import FakeArtifactStore, FakeBrowserStateAdapter, clean_shutdown, observation
 
 
 @pytest.mark.asyncio
