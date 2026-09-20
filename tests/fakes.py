@@ -23,6 +23,7 @@ from browser_agent.state.models import (
     ArtifactRef,
     CapturePolicy,
     CheckpointRef,
+    CleanShutdownProof,
     DiagnosticRef,
     EpisodeLease,
     EpisodeMetadata,
@@ -193,6 +194,7 @@ class FakeBrowserStateAdapter:
         self._open: dict[str, EpisodeLease] = {}
         self.policy_by_episode: dict[str, CapturePolicy] = {}
         self.metadata_by_episode: dict[str, EpisodeMetadata] = {}
+        self._stopped: set[str] = set()
 
     def _lease(self, parent_checkpoint_id: str | None = None) -> EpisodeLease:
         number = self._next_episode
@@ -247,6 +249,8 @@ class FakeBrowserStateAdapter:
 
     async def checkpoint(self, lease: EpisodeLease, reason: str) -> CheckpointRef:
         self._require_open(lease)
+        if lease.episode_id not in self._stopped:
+            raise LeaseClosedError("episode has no clean shutdown proof")
         checkpoint = self._checkpoint(lease, reason)
         del self._open[lease.lease_id]
         return checkpoint
@@ -264,6 +268,8 @@ class FakeBrowserStateAdapter:
 
     async def close_episode(self, lease: EpisodeLease, outcome: EpisodeOutcome) -> CheckpointRef:
         self._require_open(lease)
+        if lease.episode_id not in self._stopped:
+            raise LeaseClosedError("episode has no clean shutdown proof")
         checkpoint = self._checkpoint(lease, f"terminal:{outcome}")
         del self._open[lease.lease_id]
         return checkpoint
@@ -272,6 +278,12 @@ class FakeBrowserStateAdapter:
         self._require_open(lease)
         del self._open[lease.lease_id]
         return DiagnosticRef(f"diagnostic:{type(error).__name__}", lease.episode_id)
+
+    async def confirm_shutdown(self, lease: EpisodeLease, proof: CleanShutdownProof) -> None:
+        self._require_open(lease)
+        if proof.episode_id != lease.episode_id:
+            raise ValueError("shutdown proof belongs to another episode")
+        self._stopped.add(lease.episode_id)
 
     async def restore(self, checkpoint: CheckpointRef) -> EpisodeLease:
         return self._lease(checkpoint.checkpoint_id)

@@ -30,6 +30,7 @@ from .models import (
     CapturePolicy,
     CheckpointError,
     CheckpointRef,
+    CleanShutdownProof,
     DiagnosticRef,
     EpisodeLease,
     EpisodeMetadata,
@@ -47,6 +48,7 @@ class _Episode:
     profile: Path
     policy: CapturePolicy
     metadata: EpisodeMetadata
+    shutdown: CleanShutdownProof | None = None
 
 
 class LocalBrowserStateAdapter:
@@ -107,6 +109,13 @@ class LocalBrowserStateAdapter:
             outcome=result.status,
         )
 
+    async def confirm_shutdown(self, lease: EpisodeLease, proof: CleanShutdownProof) -> None:
+        episode = self._require_open(lease)
+        if proof.episode_id != lease.episode_id:
+            raise CheckpointError("shutdown proof belongs to another episode")
+        self._verify_stopped_profile(episode.profile)
+        episode.shutdown = proof
+
     async def checkpoint(self, lease: EpisodeLease, reason: str) -> CheckpointRef:
         return await self._seal(lease, reason)
 
@@ -117,10 +126,12 @@ class LocalBrowserStateAdapter:
         episode = self._take(lease)
         self._discard_captures(lease.episode_id)
         try:
+            profile = await self._quarantine_profile(episode)
             diagnostic = await self._diagnostic(
                 episode,
                 phase="abort",
                 error_type=type(error).__name__,
+                quarantined_profile=profile,
             )
         finally:
             shutil.rmtree(episode.directory, ignore_errors=True)
@@ -165,6 +176,8 @@ class LocalBrowserStateAdapter:
         try:
             if not episode.policy.restricted_storage:
                 raise CheckpointError("capture policy forbids restricted checkpoint storage")
+            if episode.shutdown is None:
+                raise CheckpointError("episode has no clean shutdown proof")
             self._verify_stopped_profile(episode.profile)
             profile_bytes, files = archive_profile(episode.profile)
             profile_ref = await self._artifacts.put(
@@ -183,6 +196,7 @@ class LocalBrowserStateAdapter:
                 files=files,
                 policy=episode.policy,
                 metadata=episode.metadata,
+                shutdown=episode.shutdown,
             )
             manifest_ref = await self._artifacts.put(
                 manifest_bytes,
@@ -194,6 +208,8 @@ class LocalBrowserStateAdapter:
             )
         except BaseException as error:
             try:
+                if profile_ref is None:
+                    profile_ref = await self._quarantine_profile(episode)
                 await self._diagnostic(
                     episode,
                     phase="seal",
@@ -250,6 +266,22 @@ class LocalBrowserStateAdapter:
         with suppress(Exception):
             self._publish_quarantine_pointer(diagnostic_id, data, artifact)
         return DiagnosticRef(diagnostic_id, episode.lease.episode_id, artifact)
+
+    async def _quarantine_profile(self, episode: _Episode) -> ArtifactRef | None:
+        if not episode.policy.restricted_storage:
+            return None
+        try:
+            data, _files = archive_profile(episode.profile, reject_symlinks=False)
+            return await self._artifacts.put(
+                data,
+                kind=ArtifactKind.DIAGNOSTIC,
+                media_type="application/x-tar",
+                schema_version=1,
+                security_class=SecurityClass.RESTRICTED,
+                redaction_policy_version=episode.policy.redaction_policy_version,
+            )
+        except Exception:
+            return None
 
     def _publish_quarantine_pointer(
         self, diagnostic_id: str, diagnostic: bytes, artifact: ArtifactRef | None

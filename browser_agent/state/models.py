@@ -108,6 +108,19 @@ class EpisodeLease:
 
 
 @dataclass(frozen=True, slots=True)
+class CleanShutdownProof:
+    episode_id: str
+    process_id: int
+    exit_code: int
+
+    def __post_init__(self) -> None:
+        if self.process_id <= 0:
+            raise ValueError("process ID must be greater than zero")
+        if self.exit_code != 0:
+            raise ValueError("clean shutdown requires a zero exit code")
+
+
+@dataclass(frozen=True, slots=True)
 class CapturePolicy:
     version: str
     redaction_policy_version: str

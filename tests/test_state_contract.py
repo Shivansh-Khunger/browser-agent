@@ -9,12 +9,17 @@ from browser_agent.state.models import (
     ActionRequest,
     ArtifactKind,
     CapturePolicy,
+    CleanShutdownProof,
     EpisodeMetadata,
     EpisodeOutcome,
     LeaseClosedError,
     SecurityClass,
 )
 from tests.fakes import FakeArtifactStore, FakeBrowserStateAdapter, observation
+
+
+def clean_shutdown(episode_id: str) -> CleanShutdownProof:
+    return CleanShutdownProof(episode_id=episode_id, process_id=4242, exit_code=0)
 
 
 @pytest.mark.asyncio
@@ -63,6 +68,7 @@ async def test_state_adapter_records_action_and_returns_terminal_checkpoint() ->
         ActionResult(OutcomeStatus.SUCCEEDED, "navigated"),
         observation("o1"),
     )
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
     checkpoint = await adapter.close_episode(lease, EpisodeOutcome.SUCCEEDED)
 
     assert delta.episode_id == lease.episode_id
@@ -82,6 +88,7 @@ async def test_checkpoint_seals_and_invalidates_episode_before_restore() -> None
         EpisodeMetadata(code_revision="abc123", platform="test"),
     )
 
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
     checkpoint = await adapter.checkpoint(lease, "explicit")
 
     with pytest.raises(LeaseClosedError):
@@ -107,6 +114,7 @@ async def test_capture_cannot_finish_after_episode_is_sealed() -> None:
         lease,
         ActionRequest(task_id="task-1", action_id="action-1", name="navigate"),
     )
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
     await adapter.checkpoint(lease, "explicit")
 
     with pytest.raises(LeaseClosedError):

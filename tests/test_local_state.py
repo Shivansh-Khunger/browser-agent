@@ -11,6 +11,7 @@ from browser_agent.state.models import (
     ArtifactRef,
     CapturePolicy,
     CheckpointError,
+    CleanShutdownProof,
     EpisodeMetadata,
     EpisodeOutcome,
     LeaseClosedError,
@@ -46,6 +47,10 @@ class _FailingManifestStore:
 
     async def get(self, reference: ArtifactRef) -> bytes:
         return await self._backing.get(reference)
+
+
+def clean_shutdown(episode_id: str) -> CleanShutdownProof:
+    return CleanShutdownProof(episode_id=episode_id, process_id=4242, exit_code=0)
 
 
 @pytest.mark.asyncio
@@ -133,6 +138,7 @@ async def test_fresh_episode_seals_encrypted_checkpoint_and_restores_child(tmp_p
         EpisodeMetadata(code_revision="abc123", platform="test"),
     )
 
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
     checkpoint = await adapter.close_episode(lease, EpisodeOutcome.SUCCEEDED)
     assert checkpoint.clean_shutdown is True
     assert checkpoint.parent_id is None
@@ -159,6 +165,7 @@ async def test_episode_without_restricted_storage_permission_cannot_seal(tmp_pat
         EpisodeMetadata(code_revision="abc123", platform="test"),
     )
 
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
     with pytest.raises(CheckpointError):
         await adapter.close_episode(lease, EpisodeOutcome.SUCCEEDED)
 
@@ -181,6 +188,7 @@ async def test_episode_profiles_are_isolated_and_sealed_source_stays_immutable(t
     (adapter._profile_directory(first) / "Cookies").write_bytes(b"first-profile-secret")
     assert not (adapter._profile_directory(second) / "Cookies").exists()
 
+    await adapter.confirm_shutdown(first, clean_shutdown(first.episode_id))
     checkpoint = await adapter.close_episode(first, EpisodeOutcome.SUCCEEDED)
     assert checkpoint.manifest is not None
     original_manifest = await store.get(checkpoint.manifest)
@@ -189,6 +197,7 @@ async def test_episode_profiles_are_isolated_and_sealed_source_stays_immutable(t
         adapter._profile_directory(restored) / "Cookies"
     ).read_bytes() == b"first-profile-secret"
     (adapter._profile_directory(restored) / "Cookies").write_bytes(b"child-secret")
+    await adapter.confirm_shutdown(restored, clean_shutdown(restored.episode_id))
     await adapter.close_episode(restored, EpisodeOutcome.SUCCEEDED)
 
     assert await store.get(checkpoint.manifest) == original_manifest
@@ -217,6 +226,7 @@ async def test_missing_key_seal_discards_profile_and_invalidates_lease(tmp_path)
     secret = b"unsealed-profile-canary"
     (adapter._profile_directory(lease) / "Cookies").write_bytes(secret)
 
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
     with pytest.raises(CheckpointError):
         await adapter.close_episode(lease, EpisodeOutcome.SUCCEEDED)
     with pytest.raises(LeaseClosedError):
@@ -261,9 +271,38 @@ async def test_active_profile_marker_prevents_checkpoint_publication(tmp_path) -
     (adapter._profile_directory(lease) / "SingletonLock").write_text("still running")
 
     with pytest.raises(CheckpointError):
+        await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
+    diagnostic = await adapter.abort_episode(lease, RuntimeError("browser still running"))
+
+    assert diagnostic.artifact is not None
+    pointers = list((tmp_path / "state" / "quarantine").glob("*.json"))
+    data = json.loads(pointers[0].read_text())["diagnostic"]
+    assert data["profile_retained"] is True
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_requires_process_exit_proof(tmp_path) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    adapter = LocalBrowserStateAdapter(tmp_path / "state", store)
+    lease = await adapter.open_episode(
+        None,
+        CapturePolicy(
+            version="capture-v1",
+            redaction_policy_version="redaction-v1",
+            restricted_storage=True,
+        ),
+        EpisodeMetadata(code_revision="abc123", platform="test"),
+    )
+    secret = b"unverified-shutdown-canary"
+    (adapter._profile_directory(lease) / "Cookies").write_bytes(secret)
+
+    with pytest.raises(CheckpointError):
         await adapter.close_episode(lease, EpisodeOutcome.SUCCEEDED)
 
-    assert not list((tmp_path / "artifacts" / "restricted").rglob("*"))
+    pointers = list((tmp_path / "state" / "quarantine").glob("*.json"))
+    diagnostic = json.loads(pointers[0].read_text())["diagnostic"]
+    assert diagnostic["profile_retained"] is True
+    assert all(secret not in path.read_bytes() for path in tmp_path.rglob("*") if path.is_file())
 
 
 @pytest.mark.asyncio
@@ -282,6 +321,7 @@ async def test_manifest_publication_failure_keeps_only_encrypted_quarantine(tmp_
     secret = b"atomic-publication-canary"
     (adapter._profile_directory(lease) / "Cookies").write_bytes(secret)
 
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
     with pytest.raises(CheckpointError):
         await adapter.close_episode(lease, EpisodeOutcome.SUCCEEDED)
 

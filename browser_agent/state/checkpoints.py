@@ -17,18 +17,23 @@ from .models import (
     ArtifactRef,
     CapturePolicy,
     CheckpointError,
+    CleanShutdownProof,
     EpisodeMetadata,
     SecurityClass,
 )
 
 
-def archive_profile(root: Path) -> tuple[bytes, list[dict[str, object]]]:
+def archive_profile(
+    root: Path, *, reject_symlinks: bool = True
+) -> tuple[bytes, list[dict[str, object]]]:
     files = _file_manifest(root)
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
         for path in sorted(root.rglob("*")):
             if path.is_symlink():
-                raise CheckpointError("profile symlinks are not supported")
+                if reject_symlinks:
+                    raise CheckpointError("profile symlinks are not supported")
+                continue
             relative = path.relative_to(root).as_posix()
             info = archive.gettarinfo(str(path), arcname=relative)
             info.uid = 0
@@ -74,6 +79,7 @@ def encode_manifest(
     files: list[dict[str, object]],
     policy: CapturePolicy,
     metadata: EpisodeMetadata,
+    shutdown: CleanShutdownProof,
 ) -> bytes:
     manifest = {
         "schema_version": 1,
@@ -81,6 +87,11 @@ def encode_manifest(
         "parent_id": parent_id,
         "reason": reason,
         "clean_shutdown": True,
+        "clean_shutdown_proof": {
+            "episode_id": shutdown.episode_id,
+            "process_id": shutdown.process_id,
+            "exit_code": shutdown.exit_code,
+        },
         "created_at": datetime.now(UTC).isoformat(),
         "profile": artifact_to_dict(profile),
         "files": files,

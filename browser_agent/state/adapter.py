@@ -10,6 +10,7 @@ from .models import (
     ActionRequest,
     CapturePolicy,
     CheckpointRef,
+    CleanShutdownProof,
     DiagnosticRef,
     EpisodeLease,
     EpisodeMetadata,
@@ -37,6 +38,8 @@ class BrowserStateAdapter(Protocol):
         result: ActionResult,
         observation: Observation | None,
     ) -> StateDelta: ...
+
+    async def confirm_shutdown(self, lease: EpisodeLease, proof: CleanShutdownProof) -> None: ...
 
     async def checkpoint(self, lease: EpisodeLease, reason: str) -> CheckpointRef: ...
 
