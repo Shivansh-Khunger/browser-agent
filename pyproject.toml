@@ -56,6 +56,7 @@ include = [
     "browser_agent/browser/transport.py",
     "browser_agent/state/adapter.py",
     "browser_agent/state/artifacts.py",
+    "browser_agent/state/checkpoints.py",
     "browser_agent/state/local.py",
     "browser_agent/state/models.py",
     "tests/fakes.py",

@@ -8,6 +8,7 @@ from browser_agent.state.artifacts import LocalArtifactStore
 from browser_agent.state.local import LocalBrowserStateAdapter
 from browser_agent.state.models import (
     ArtifactKind,
+    ArtifactRef,
     CapturePolicy,
     CheckpointError,
     EpisodeMetadata,
@@ -16,6 +17,35 @@ from browser_agent.state.models import (
     RestrictedStorageError,
     SecurityClass,
 )
+
+
+class _FailingManifestStore:
+    def __init__(self, backing: LocalArtifactStore) -> None:
+        self._backing = backing
+
+    async def put(
+        self,
+        data: bytes,
+        *,
+        kind: ArtifactKind,
+        media_type: str,
+        schema_version: int,
+        security_class: SecurityClass,
+        redaction_policy_version: str,
+    ) -> ArtifactRef:
+        if kind is ArtifactKind.CHECKPOINT and media_type == "application/json":
+            raise OSError("injected manifest publication failure")
+        return await self._backing.put(
+            data,
+            kind=kind,
+            media_type=media_type,
+            schema_version=schema_version,
+            security_class=security_class,
+            redaction_policy_version=redaction_policy_version,
+        )
+
+    async def get(self, reference: ArtifactRef) -> bytes:
+        return await self._backing.get(reference)
 
 
 @pytest.mark.asyncio
@@ -107,6 +137,7 @@ async def test_fresh_episode_seals_encrypted_checkpoint_and_restores_child(tmp_p
     assert checkpoint.clean_shutdown is True
     assert checkpoint.parent_id is None
     assert checkpoint.manifest is not None
+    assert checkpoint.manifest.security_class is SecurityClass.RESTRICTED
     assert not hasattr(lease, "profile_path")
 
     manifest = json.loads((await store.get(checkpoint.manifest)).decode())
@@ -162,6 +193,12 @@ async def test_episode_profiles_are_isolated_and_sealed_source_stays_immutable(t
 
     assert await store.get(checkpoint.manifest) == original_manifest
     await adapter.abort_episode(second, RuntimeError("test cleanup"))
+    assert all(
+        b"first-profile-secret" not in path.read_bytes()
+        and b"child-secret" not in path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    )
 
 
 @pytest.mark.asyncio
@@ -206,3 +243,51 @@ async def test_abort_returns_redacted_diagnostic_and_discards_profile(tmp_path) 
     assert b"secret error text" not in data
     with pytest.raises(LeaseClosedError):
         await adapter.abort_episode(lease, RuntimeError("again"))
+
+
+@pytest.mark.asyncio
+async def test_active_profile_marker_prevents_checkpoint_publication(tmp_path) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    adapter = LocalBrowserStateAdapter(tmp_path / "state", store)
+    lease = await adapter.open_episode(
+        None,
+        CapturePolicy(
+            version="capture-v1",
+            redaction_policy_version="redaction-v1",
+            restricted_storage=True,
+        ),
+        EpisodeMetadata(code_revision="abc123", platform="test"),
+    )
+    (adapter._profile_directory(lease) / "SingletonLock").write_text("still running")
+
+    with pytest.raises(CheckpointError):
+        await adapter.close_episode(lease, EpisodeOutcome.SUCCEEDED)
+
+    assert not list((tmp_path / "artifacts" / "restricted").rglob("*"))
+
+
+@pytest.mark.asyncio
+async def test_manifest_publication_failure_keeps_only_encrypted_quarantine(tmp_path) -> None:
+    backing = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    adapter = LocalBrowserStateAdapter(tmp_path / "state", _FailingManifestStore(backing))
+    lease = await adapter.open_episode(
+        None,
+        CapturePolicy(
+            version="capture-v1",
+            redaction_policy_version="redaction-v1",
+            restricted_storage=True,
+        ),
+        EpisodeMetadata(code_revision="abc123", platform="test"),
+    )
+    secret = b"atomic-publication-canary"
+    (adapter._profile_directory(lease) / "Cookies").write_bytes(secret)
+
+    with pytest.raises(CheckpointError):
+        await adapter.close_episode(lease, EpisodeOutcome.SUCCEEDED)
+
+    pointers = list((tmp_path / "state" / "quarantine").glob("*.json"))
+    assert len(pointers) == 1
+    diagnostic = json.loads(pointers[0].read_text())["diagnostic"]
+    assert diagnostic["profile_retained"] is True
+    assert diagnostic["quarantined_profile"]["content_id"].startswith("hmac-sha256:")
+    assert all(secret not in path.read_bytes() for path in tmp_path.rglob("*") if path.is_file())
