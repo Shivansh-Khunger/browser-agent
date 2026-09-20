@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+from asyncio import Future, get_running_loop
 from collections import deque
+from pathlib import Path
 
 from browser_agent.browser.models import (
     ActionResult,
     BrowserAction,
     BrowserConfig,
+    BrowserMetadata,
     Observation,
     OutcomeStatus,
     SessionLifecycle,
@@ -14,6 +17,7 @@ from browser_agent.browser.models import (
     StaleTargetError,
     Viewport,
 )
+from browser_agent.browser.runtime import RuntimeFailure, RuntimeFailureKind
 from browser_agent.browser.transport import BrowserTransport
 from browser_agent.state.models import (
     ActionCapture,
@@ -99,6 +103,98 @@ class FakeBrowserTransport:
         self._active_target_id = None
 
 
+class FakeOwnedBrowser:
+    """Controllable owned process for lifecycle tests."""
+
+    def __init__(self, *, close_exit_code: int | None = 0) -> None:
+        loop = get_running_loop()
+        self._exit: Future[int] = loop.create_future()
+        self._failure: Future[RuntimeFailure] = loop.create_future()
+        self._close_exit_code = close_exit_code
+        self.process_id = 4242
+        self.active_target_id: str | None = "launch-target"
+        self.close_requests = 0
+        self.connection_closes = 0
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    async def observe(self) -> Observation:
+        return observation("runtime-observation")
+
+    async def execute(self, action: BrowserAction) -> ActionResult:
+        return ActionResult(OutcomeStatus.SUCCEEDED, f"{action.name} completed")
+
+    async def wait_for_failure(self) -> RuntimeFailure:
+        return await self._failure
+
+    async def request_close(self) -> None:
+        self.close_requests += 1
+        if self._close_exit_code is not None and not self._exit.done():
+            self._exit.set_result(self._close_exit_code)
+
+    async def close_connection(self) -> None:
+        self.connection_closes += 1
+
+    async def wait_for_exit(self) -> int:
+        return await self._exit
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        if not self._exit.done():
+            self._exit.set_result(-15)
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        if not self._exit.done():
+            self._exit.set_result(-9)
+
+    def fail_process(self, exit_code: int) -> None:
+        if not self._exit.done():
+            self._exit.set_result(exit_code)
+        if not self._failure.done():
+            self._failure.set_result(RuntimeFailure(RuntimeFailureKind.PROCESS_EXIT, exit_code))
+
+    def disconnect(self) -> None:
+        if not self._failure.done():
+            self._failure.set_result(RuntimeFailure(RuntimeFailureKind.DISCONNECTED))
+
+
+class FakeBrowserLauncher:
+    def __init__(
+        self,
+        runtime: FakeOwnedBrowser,
+        *,
+        inspect_error: BaseException | None = None,
+        launch_error: BaseException | None = None,
+    ) -> None:
+        self.runtime = runtime
+        self.inspect_error = inspect_error
+        self.launch_error = launch_error
+        self.launched_profile: Path | None = None
+        self.metadata = BrowserMetadata(
+            executable=Path("/installed/chrome"),
+            browser_version="Chrome 140.0.0.0",
+            nodriver_version="0.50.3",
+            platform="test-platform",
+            config_digest="sha256:config",
+        )
+
+    async def inspect(self, config: BrowserConfig) -> BrowserMetadata:
+        del config
+        if self.inspect_error:
+            raise self.inspect_error
+        return self.metadata
+
+    async def launch(
+        self, config: BrowserConfig, profile: Path, metadata: BrowserMetadata
+    ) -> FakeOwnedBrowser:
+        del config, metadata
+        self.launched_profile = profile
+        if self.launch_error:
+            raise self.launch_error
+        return self.runtime
+
+
 class FakeBrowserSession:
     """Public session fake that exercises an injected browser transport."""
 
@@ -118,6 +214,10 @@ class FakeBrowserSession:
     @property
     def active_target_id(self) -> str | None:
         return self._transport.active_target_id
+
+    @property
+    def metadata(self) -> BrowserMetadata | None:
+        return None
 
     async def start(self) -> None:
         if self._lifecycle is not SessionLifecycle.NEW:

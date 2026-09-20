@@ -64,6 +64,15 @@ class BrowserConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class BrowserMetadata:
+    executable: Path
+    browser_version: str
+    nodriver_version: str
+    platform: str
+    config_digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class Viewport:
     width: float
     height: float
@@ -196,6 +205,21 @@ class SessionStateError(BrowserAdapterError):
 
 class BrowserLaunchError(BrowserAdapterError):
     code = "launch_failed"
+    fatal = True
+
+
+class BrowserDisconnectedError(BrowserAdapterError):
+    code = "browser_disconnected"
+    fatal = True
+
+
+class BrowserExitedError(BrowserAdapterError):
+    code = "browser_exited"
+    fatal = True
+
+
+class BrowserShutdownError(BrowserAdapterError):
+    code = "shutdown_failed"
     fatal = True
 
 

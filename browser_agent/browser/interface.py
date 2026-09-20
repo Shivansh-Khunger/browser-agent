@@ -8,6 +8,7 @@ from .models import (
     ActionResult,
     BrowserAction,
     BrowserConfig,
+    BrowserMetadata,
     Observation,
     SessionLifecycle,
 )
@@ -23,6 +24,9 @@ class BrowserSession(Protocol):
 
     @property
     def active_target_id(self) -> str | None: ...
+
+    @property
+    def metadata(self) -> BrowserMetadata | None: ...
 
     async def start(self) -> None: ...
 
