@@ -51,6 +51,16 @@ class ArtifactNotFoundError(StateAdapterError):
     code = "artifact_not_found"
 
 
+class ArtifactIntegrityError(StateAdapterError):
+    code = "artifact_integrity_failed"
+    fatal = True
+
+
+class RestrictedStorageError(StateAdapterError):
+    code = "restricted_storage_unavailable"
+    fatal = True
+
+
 class CheckpointError(StateAdapterError):
     code = "checkpoint_failed"
     fatal = True
