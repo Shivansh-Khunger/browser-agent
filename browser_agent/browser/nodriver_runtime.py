@@ -93,8 +93,7 @@ class NodriverOwnedBrowser:
         self._browser = browser
         self._config = config
         self._process = process
-        target = cast(Any, browser.main_tab.target)
-        self._launch_target_id = str(getattr(target, "target_id", target))
+        self._launch_target_id = _target_id(browser)
         self._observation_count = 0
         self._document_generation = 0
         self._current_observation_id: str | None = None
@@ -160,9 +159,7 @@ class NodriverOwnedBrowser:
         return await click(self._browser.main_tab, backend_node_id, self._config.timeouts)
 
     def _require_active_tab(self) -> None:
-        target = cast(Any, self._browser.main_tab.target)
-        current_id = str(getattr(target, "target_id", target))
-        if current_id != self._launch_target_id:
+        if _target_id(self._browser) != self._launch_target_id:
             raise ClosedTargetError("the owned tab is no longer the active target")
 
     async def wait_for_failure(self) -> RuntimeFailure:
@@ -200,6 +197,11 @@ class NodriverOwnedBrowser:
             async with asyncio.timeout(timeout):
                 await self.close_connection()
         await _terminate_process(self._process, timeout)
+
+
+def _target_id(browser: Browser) -> str:
+    target = cast(Any, browser.main_tab.target)
+    return str(getattr(target, "target_id", target))
 
 
 def _resolve_executable(configured: Path | None) -> Path:

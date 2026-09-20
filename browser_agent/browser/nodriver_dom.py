@@ -1,15 +1,18 @@
 # pyright: reportMissingTypeStubs=false, reportPrivateUsage=false
 # pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false
 # pyright: reportUnknownVariableType=false
-"""Flatten one main-frame CDP accessibility/DOM snapshot into an Observation."""
+"""Flatten one main-frame CDP accessibility/DOM tree into an Observation."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from nodriver import cdp
 from nodriver.cdp.accessibility import AXNode, AXNodeId, AXPropertyName, AXValue
 from nodriver.cdp.dom import BackendNodeId, Node
 from nodriver.core.tab import Tab
 
+from .geometry import quad_bounds
 from .models import ContextNode, Observation, SemanticControl, TargetHandle, Viewport
 
 _INTERACTIVE_ROLES = frozenset(
@@ -65,12 +68,12 @@ _STATE_PROPERTIES = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
 class ObservationCapture:
-    """Control index (control_id -> backend_node_id) for the observation just built."""
+    """An Observation plus its control_id -> backend_node_id index."""
 
-    def __init__(self, observation: Observation, control_index: dict[str, BackendNodeId]) -> None:
-        self.observation = observation
-        self.control_index = control_index
+    observation: Observation
+    control_index: dict[str, BackendNodeId]
 
 
 async def capture_observation(
@@ -183,11 +186,11 @@ def _index_dom(root: Node) -> dict[BackendNodeId, Node]:
     by_backend_id: dict[BackendNodeId, Node] = {}
 
     def walk(node: Node) -> None:
+        # Same-frame only: iframe content_document subtrees are out of scope for
+        # issue #12 (main frame only) and get_full_ax_tree() never crosses them.
         by_backend_id[node.backend_node_id] = node
         for child in node.children or ():
             walk(child)
-        if node.content_document is not None:
-            walk(node.content_document)
         for shadow_root in node.shadow_roots or ():
             walk(shadow_root)
 
@@ -225,10 +228,7 @@ async def _build_control(
         except Exception:
             visible = False
         else:
-            quad = box.content
-            xs = quad[0::2]
-            ys = quad[1::2]
-            bounds = (min(xs), min(ys), max(xs), max(ys))
+            bounds = quad_bounds(box.content)
     return SemanticControl(
         handle=TargetHandle(observation_id, control_id),
         role=role,

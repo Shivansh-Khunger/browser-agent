@@ -17,6 +17,13 @@ def test_normalize_url_rejects_blank_or_hostless_input() -> None:
     assert _normalize_url("https:///no-host") is None
 
 
+def test_normalize_url_rejects_backslash_host_confusion() -> None:
+    # Chrome's WHATWG URL parser folds '\\' into '/' in the authority, resolving
+    # this to host "evil.test" even though urlparse reads host "allowed.test" -
+    # exactly the divergence the allowlist check below must not be fooled by.
+    assert _normalize_url(r"https://evil.test\@allowed.test/") is None
+
+
 def test_domain_allowed_with_empty_allowlist_is_unrestricted() -> None:
     assert _domain_allowed("https://anything.test", ()) is True
 

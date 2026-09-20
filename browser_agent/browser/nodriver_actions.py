@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import re
-from contextlib import suppress
 from urllib.parse import urlparse
 
 from nodriver import cdp
-from nodriver.cdp.dom import BackendNodeId
+from nodriver.cdp.dom import BackendNodeId, Node
 from nodriver.core.tab import Tab
 
+from .geometry import quad_center
 from .models import ActionResult, BrowserConfig, OutcomeStatus, StaleTargetError, TimeoutConfig
 
 _SCHEME = re.compile(r"^https?://", re.IGNORECASE)
@@ -51,11 +51,22 @@ async def navigate(tab: Tab, config: BrowserConfig, url: str) -> ActionResult:
                 f"navigation failed: {error_text}",
                 error_code="navigation_failed",
             )
-        with suppress(TimeoutError):
+        settled = True
+        try:
             async with asyncio.timeout(config.timeouts.navigation):
                 await loaded.wait()
+        except TimeoutError:
+            settled = False
     finally:
         tab.remove_handler(cdp.page.LoadEventFired, _on_load)
+
+    if not settled:
+        return ActionResult(
+            OutcomeStatus.UNCERTAIN,
+            "navigation was dispatched but the page did not report load "
+            "completion before the timeout",
+            error_code="settle_timeout",
+        )
     return ActionResult(OutcomeStatus.SUCCEEDED, "navigate completed")
 
 
@@ -63,19 +74,17 @@ async def click(tab: Tab, backend_node_id: BackendNodeId, timeouts: TimeoutConfi
     try:
         await tab.send(cdp.dom.scroll_into_view_if_needed(backend_node_id=backend_node_id))
         box = await tab.send(cdp.dom.get_box_model(backend_node_id=backend_node_id))
+        subtree = await tab.send(
+            cdp.dom.describe_node(backend_node_id=backend_node_id, depth=-1, pierce=False)
+        )
     except Exception as error:
         raise StaleTargetError(f"control geometry is unavailable: {error}") from error
 
-    quad = box.content
-    xs = quad[0::2]
-    ys = quad[1::2]
-    x = (min(xs) + max(xs)) / 2
-    y = (min(ys) + max(ys)) / 2
-
+    x, y = quad_center(box.content)
     hit_backend_id, _frame_id, _node_id = await tab.send(
         cdp.dom.get_node_for_location(round(x), round(y), include_user_agent_shadow_dom=True)
     )
-    if hit_backend_id != backend_node_id:
+    if hit_backend_id not in _subtree_backend_ids(subtree):
         raise StaleTargetError(
             "control was obstructed or moved before the click could be dispatched"
         )
@@ -91,12 +100,34 @@ async def click(tab: Tab, backend_node_id: BackendNodeId, timeouts: TimeoutConfi
                 click_count=1,
             )
         )
-    await asyncio.sleep(min(timeouts.settle, 0.5))
+    await asyncio.sleep(timeouts.settle)
     return ActionResult(OutcomeStatus.SUCCEEDED, "click completed")
+
+
+def _subtree_backend_ids(node: Node) -> set[BackendNodeId]:
+    """A native click may land on a descendant (e.g. a <span> inside a <button>);
+    accept any hit inside the target's own subtree, not only the target itself."""
+    ids: set[BackendNodeId] = set()
+
+    def walk(current: Node) -> None:
+        ids.add(current.backend_node_id)
+        for child in current.children or ():
+            walk(child)
+        for shadow_root in current.shadow_roots or ():
+            walk(shadow_root)
+
+    walk(node)
+    return ids
 
 
 def _normalize_url(raw: str) -> str | None:
     if not raw or not raw.strip():
+        return None
+    if "\\" in raw:
+        # Chrome's WHATWG URL parser folds backslashes into '/' in the authority
+        # (e.g. "https://evil\\@allowed.test/" resolves to host "evil"), which
+        # diverges from urlparse's RFC-3986 reading used for the allowlist check
+        # below. Rejecting backslashes outright closes that host-confusion gap.
         return None
     candidate = raw if _SCHEME.match(raw) else f"https://{raw}"
     parsed = urlparse(candidate)
