@@ -124,8 +124,10 @@ class NodriverSession:
                 )
                 self._runtime = await self._launcher.launch(self._config, profile, self._metadata)
             except BaseException as error:
-                await asyncio.shield(self._cleanup_failed_start(error))
-                self._lifecycle = SessionLifecycle.CLOSED
+                try:
+                    await asyncio.shield(self._cleanup_failed_start(error))
+                finally:
+                    self._lifecycle = SessionLifecycle.CLOSED
                 raise
             self._lifecycle = SessionLifecycle.RUNNING
             self._monitor = asyncio.create_task(
@@ -173,6 +175,8 @@ class NodriverSession:
 
     async def _close_once(self) -> None:
         if self._lifecycle is SessionLifecycle.CLOSED:
+            if self._fatal_error is not None:
+                raise self._fatal_error
             return
         if self._lifecycle is SessionLifecycle.NEW:
             self._lifecycle = SessionLifecycle.CLOSED
@@ -180,6 +184,8 @@ class NodriverSession:
         if self._lifecycle is SessionLifecycle.CLOSING and self._monitor is not None:
             with suppress(Exception):
                 await asyncio.shield(self._monitor)
+            if self._fatal_error is not None:
+                raise self._fatal_error
             return
         self._lifecycle = SessionLifecycle.CLOSING
         await self._cancel_monitor()
@@ -197,28 +203,34 @@ class NodriverSession:
                     await runtime.close_connection()
             if exit_code != 0:
                 raise BrowserExitedError(f"Chrome exited with status {exit_code}")
-            await self._state.confirm_shutdown(
-                lease,
-                CleanShutdownProof(
-                    episode_id=lease.episode_id,
-                    process_id=runtime.process_id,
-                    exit_code=exit_code,
-                ),
-            )
-            self._terminal_checkpoint = await self._state.close_episode(
-                lease, EpisodeOutcome.SUCCEEDED
-            )
+            async with asyncio.timeout(self._config.timeouts.shutdown):
+                await self._state.confirm_shutdown(
+                    lease,
+                    CleanShutdownProof(
+                        episode_id=lease.episode_id,
+                        process_id=runtime.process_id,
+                        exit_code=exit_code,
+                    ),
+                )
+                self._terminal_checkpoint = await self._state.close_episode(
+                    lease, EpisodeOutcome.SUCCEEDED
+                )
         except BaseException as error:
             if isinstance(error, asyncio.CancelledError):
                 raise
-            await self._force_stop(runtime)
-            await self._abort_episode(lease, error)
-            self._fatal_error = (
+            terminal_error: BaseException = (
                 BrowserShutdownError("Chrome shutdown timed out")
                 if isinstance(error, TimeoutError)
                 else error
             )
-            raise self._fatal_error from error
+            try:
+                await self._force_stop(runtime)
+            except BrowserShutdownError as cleanup_error:
+                terminal_error = cleanup_error
+            else:
+                await self._abort_episode(lease, terminal_error)
+            self._fatal_error = terminal_error
+            raise terminal_error from error
         finally:
             self._lifecycle = SessionLifecycle.CLOSED
 
@@ -237,44 +249,46 @@ class NodriverSession:
             self._lifecycle = SessionLifecycle.CLOSING
         if failure.kind is RuntimeFailureKind.DISCONNECTED:
             error: BaseException = BrowserDisconnectedError("Chrome DevTools connection closed")
-            await self._force_stop(runtime)
+            try:
+                await self._force_stop(runtime)
+            except BrowserShutdownError as cleanup_error:
+                error = cleanup_error
+                cleanup_verified = False
+            else:
+                cleanup_verified = True
         else:
             error = BrowserExitedError(
                 f"Chrome exited unexpectedly with status {failure.exit_code}"
             )
+            cleanup_verified = True
             with suppress(Exception):
                 await runtime.close_connection()
-        await self._abort_episode(lease, error)
+        if cleanup_verified:
+            await self._abort_episode(lease, error)
         self._fatal_error = error
         self._lifecycle = SessionLifecycle.CLOSED
 
     async def _cleanup_failed_start(self, error: BaseException) -> None:
+        cleanup_verified = not isinstance(error, BrowserShutdownError)
         if self._runtime is not None:
-            await self._force_stop(self._runtime)
-        if self._lease is not None:
+            try:
+                await self._force_stop(self._runtime)
+            except BrowserShutdownError as cleanup_error:
+                error = cleanup_error
+                cleanup_verified = False
+        if self._lease is not None and cleanup_verified:
             await self._abort_episode(self._lease, error)
         self._fatal_error = error
+        if not cleanup_verified:
+            raise error
 
     async def _abort_episode(self, lease: EpisodeLease, error: BaseException) -> None:
         with suppress(Exception):
-            self._diagnostic = await self._state.abort_episode(lease, error)
+            async with asyncio.timeout(self._config.timeouts.shutdown):
+                self._diagnostic = await self._state.abort_episode(lease, error)
 
     async def _force_stop(self, runtime: OwnedBrowser) -> None:
-        with suppress(Exception):
-            await runtime.close_connection()
-        with suppress(ProcessLookupError):
-            runtime.terminate()
-        try:
-            async with asyncio.timeout(min(1.0, self._config.timeouts.shutdown)):
-                await runtime.wait_for_exit()
-                return
-        except Exception:
-            pass
-        with suppress(ProcessLookupError):
-            runtime.kill()
-        with suppress(Exception):
-            async with asyncio.timeout(min(1.0, self._config.timeouts.shutdown)):
-                await runtime.wait_for_exit()
+        await runtime.force_stop(min(1.0, self._config.timeouts.shutdown))
 
     async def _cancel_monitor(self) -> None:
         monitor = self._monitor

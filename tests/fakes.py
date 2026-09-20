@@ -148,6 +148,12 @@ class FakeOwnedBrowser:
         if not self._exit.done():
             self._exit.set_result(-9)
 
+    async def force_stop(self, timeout: float) -> None:
+        del timeout
+        await self.close_connection()
+        self.terminate()
+        await self.wait_for_exit()
+
     def fail_process(self, exit_code: int) -> None:
         if not self._exit.done():
             self._exit.set_result(exit_code)
@@ -217,6 +223,10 @@ class FakeBrowserSession:
 
     @property
     def metadata(self) -> BrowserMetadata | None:
+        return None
+
+    @property
+    def fatal_error(self) -> BaseException | None:
         return None
 
     async def start(self) -> None:

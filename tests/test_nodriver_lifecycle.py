@@ -39,6 +39,12 @@ class SlowCloseBrowser(FakeOwnedBrowser):
         await super().request_close()
 
 
+class UnstoppableBrowser(FakeOwnedBrowser):
+    async def force_stop(self, timeout: float) -> None:
+        del timeout
+        raise BrowserShutdownError("Chrome process exit could not be verified")
+
+
 class ProfileStateAdapter(FakeBrowserStateAdapter):
     def __init__(self, root: Path) -> None:
         super().__init__()
@@ -139,7 +145,8 @@ async def test_unexpected_exit_is_fatal_and_aborts_episode(tmp_path) -> None:
     assert session.diagnostic is not None
     with pytest.raises(SessionStateError, match="session failed"):
         await session.execute(BrowserAction("after-crash"))
-    await session.close()
+    with pytest.raises(BrowserExitedError, match="status 7"):
+        await session.close()
 
 
 @pytest.mark.asyncio
@@ -161,6 +168,8 @@ async def test_disconnect_terminates_process_and_aborts_episode(tmp_path) -> Non
     assert isinstance(session.fatal_error, BrowserDisconnectedError)
     assert runtime.terminate_calls == 1
     assert session.diagnostic is not None
+    with pytest.raises(BrowserDisconnectedError):
+        await session.close()
 
 
 @pytest.mark.asyncio
@@ -183,6 +192,32 @@ async def test_shutdown_timeout_forces_process_exit_and_is_fatal(tmp_path) -> No
     assert runtime.terminate_calls == 1
     assert session.terminal_checkpoint is None
     assert session.diagnostic is not None
+
+
+@pytest.mark.asyncio
+async def test_unverified_forced_exit_is_fatal_and_does_not_remove_live_profile(
+    tmp_path,
+) -> None:
+    state = ProfileStateAdapter(tmp_path)
+    runtime = UnstoppableBrowser(close_exit_code=None)
+    session = NodriverSession(
+        BrowserConfig(),
+        state,
+        policy(),
+        episode_metadata(),
+        launcher=FakeBrowserLauncher(runtime),
+    )
+    await session.start()
+    profile = state._profile_directory(session._lease)  # type: ignore[arg-type]
+
+    runtime.disconnect()
+    await _wait_until_closed(session)
+
+    with pytest.raises(BrowserShutdownError, match="could not be verified"):
+        await session.close()
+    assert profile.exists()
+    assert session.diagnostic is None
+    assert state.aborted_with == []
 
 
 @pytest.mark.asyncio
@@ -242,8 +277,38 @@ async def test_installed_browser_releases_profile_lock_after_clean_close(tmp_pat
     profile = state._profile_directory(session._lease)  # type: ignore[arg-type]
     process_id = session._runtime.process_id  # type: ignore[union-attr]
     await session.close()
+    await session.close()
 
     assert session.terminal_checkpoint is not None
+    assert not profile.exists()
+    assert not _process_exists(process_id)
+
+
+@pytest.mark.asyncio
+async def test_installed_browser_unexpected_exit_leaks_no_process_or_profile_lock(
+    tmp_path,
+) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    state = LocalBrowserStateAdapter(tmp_path / "state", store)
+    session = NodriverSession(BrowserConfig(headless=True), state, policy(), episode_metadata())
+    try:
+        await session.start()
+    except Exception as error:
+        if "No installed Chrome or Chromium" in str(error):
+            pytest.skip(str(error))
+        raise
+
+    profile = state._profile_directory(session._lease)  # type: ignore[arg-type]
+    runtime = session._runtime
+    assert runtime is not None
+    process_id = runtime.process_id
+    runtime.terminate()  # type: ignore[attr-defined]
+    await _wait_until_closed(session)
+
+    with pytest.raises((BrowserExitedError, BrowserDisconnectedError)):
+        await session.close()
+    assert session.terminal_checkpoint is None
+    assert session.diagnostic is not None
     assert not profile.exists()
     assert not _process_exists(process_id)
 

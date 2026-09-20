@@ -25,6 +25,7 @@ from .models import (
     BrowserEvaluationError,
     BrowserLaunchError,
     BrowserMetadata,
+    BrowserShutdownError,
     Observation,
 )
 from .runtime import OwnedBrowser, RuntimeFailure, RuntimeFailureKind
@@ -64,7 +65,12 @@ class NodriverLauncher:
             return NodriverOwnedBrowser(browser)
         except BaseException as error:
             if browser is not None:
-                await _discard_partial_browser(browser)
+                try:
+                    await _discard_partial_browser(browser, min(1.0, config.timeouts.shutdown))
+                except BrowserShutdownError as cleanup_error:
+                    raise BrowserShutdownError(
+                        "Chrome launch failed and partial process cleanup was not verified"
+                    ) from cleanup_error
             if isinstance(error, asyncio.CancelledError):
                 raise
             raise BrowserLaunchError(f"Chrome launch failed: {type(error).__name__}") from error
@@ -126,6 +132,12 @@ class NodriverOwnedBrowser:
 
     def kill(self) -> None:
         self._process.kill()
+
+    async def force_stop(self, timeout: float) -> None:
+        with suppress(Exception):
+            async with asyncio.timeout(timeout):
+                await self.close_connection()
+        await _terminate_process(self._process, timeout)
 
 
 def _resolve_executable(configured: Path | None) -> Path:
@@ -203,21 +215,33 @@ async def _apply_context_overrides(browser: Browser, config: BrowserConfig) -> N
         await browser.send(cdp.browser.grant_permissions(permissions))
 
 
-async def _discard_partial_browser(browser: Browser) -> None:
+async def _discard_partial_browser(browser: Browser, timeout: float) -> None:
     with suppress(Exception):
-        async with asyncio.timeout(1):
+        async with asyncio.timeout(timeout):
             await browser.aclose()
     process = browser._process
     if process is None or process.returncode is not None:
         return
+    await _terminate_process(process, timeout)
+
+
+async def _terminate_process(process: asyncio.subprocess.Process, timeout: float) -> None:
     with suppress(ProcessLookupError):
         process.terminate()
-    with suppress(Exception):
-        async with asyncio.timeout(1):
+    try:
+        async with asyncio.timeout(timeout):
             await process.wait()
+            return
+    except Exception:
+        pass
     if process.returncode is None:
         with suppress(ProcessLookupError):
             process.kill()
-        with suppress(Exception):
-            async with asyncio.timeout(1):
+        try:
+            async with asyncio.timeout(timeout):
                 await process.wait()
+                return
+        except Exception as error:
+            raise BrowserShutdownError(
+                "partial Chrome process exit could not be verified"
+            ) from error
