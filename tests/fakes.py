@@ -239,6 +239,14 @@ class FakeBrowserSession:
     def fatal_error(self) -> BaseException | None:
         return None
 
+    @property
+    def restore_authority(self) -> CheckpointRef | None:
+        return None
+
+    @property
+    def compatibility_warnings(self) -> tuple[str, ...]:
+        return ()
+
     async def start(self) -> None:
         if self._lifecycle is not SessionLifecycle.NEW:
             raise SessionStateError(f"cannot start from {self._lifecycle}")
@@ -262,6 +270,10 @@ class FakeBrowserSession:
     async def execute(self, action: BrowserAction) -> ActionResult:
         self._require_running()
         return await self._transport.execute(action)
+
+    async def checkpoint(self, reason: str) -> CheckpointRef:
+        del reason
+        raise NotImplementedError
 
     async def close(self) -> None:
         if self._lifecycle is SessionLifecycle.CLOSED:

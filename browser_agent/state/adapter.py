@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from ..browser.models import ActionResult, Observation
 from .models import (
     ActionCapture,
     ActionEvidence,
@@ -18,6 +17,9 @@ from .models import (
     EpisodeOutcome,
     StateDelta,
 )
+
+if TYPE_CHECKING:
+    from ..browser.models import ActionResult, Observation
 
 
 @runtime_checkable

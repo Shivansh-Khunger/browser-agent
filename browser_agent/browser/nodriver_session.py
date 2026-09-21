@@ -75,11 +75,13 @@ class NodriverSession:
         self._monitor: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._terminal_checkpoint: CheckpointRef | None = None
+        self._restore_authority: CheckpointRef | None = seed_checkpoint
         self._diagnostic: DiagnosticRef | None = None
         self._fatal_error: BaseException | None = None
         self._last_observation: Observation | None = None
         self._last_state_delta: StateDelta | None = None
         self._observability_failed = False
+        self._active_episode_metadata: EpisodeMetadata | None = None
         self._action_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
 
@@ -102,6 +104,14 @@ class NodriverSession:
     @property
     def terminal_checkpoint(self) -> CheckpointRef | None:
         return self._terminal_checkpoint
+
+    @property
+    def restore_authority(self) -> CheckpointRef | None:
+        return self._restore_authority
+
+    @property
+    def compatibility_warnings(self) -> tuple[str, ...]:
+        return self._lease.compatibility_warnings if self._lease else ()
 
     @property
     def diagnostic(self) -> DiagnosticRef | None:
@@ -135,6 +145,7 @@ class NodriverSession:
                     locale_override=self._config.locale,
                     timezone_override=self._config.timezone,
                 )
+                self._active_episode_metadata = state_metadata
                 self._lease = await self._state.open_episode(
                     self._seed_checkpoint, self._policy, state_metadata
                 )
@@ -235,6 +246,19 @@ class NodriverSession:
                 self._observability_failed = True
                 return self._capture_failure_result(action, result, type(error).__name__)
             return result
+
+    async def checkpoint(self, reason: str) -> CheckpointRef:
+        if not reason.strip():
+            raise ValueError("checkpoint reason cannot be empty")
+        async with self._lifecycle_lock:
+            self._require_running()
+            rollover = asyncio.create_task(self._rollover_once(reason))
+            try:
+                return await asyncio.shield(rollover)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await rollover
+                raise
 
     @staticmethod
     def _capture_failure_result(
@@ -355,6 +379,7 @@ class NodriverSession:
                 self._terminal_checkpoint = await self._state.close_episode(
                     lease, EpisodeOutcome.SUCCEEDED
                 )
+                self._restore_authority = self._terminal_checkpoint
         except BaseException as error:
             if isinstance(error, asyncio.CancelledError):
                 raise
@@ -412,6 +437,83 @@ class NodriverSession:
             await self._abort_episode(lease, error)
         self._fatal_error = error
         self._lifecycle = SessionLifecycle.CLOSED
+
+    async def _rollover_once(self, reason: str) -> CheckpointRef:
+        runtime = self._require_running()
+        lease = self._lease
+        metadata = self._active_episode_metadata
+        if lease is None or metadata is None:
+            raise SessionStateError("session has no active episode")
+
+        async with self._action_lock:
+            await self._cancel_monitor()
+            try:
+                async with asyncio.timeout(self._config.timeouts.shutdown):
+                    await runtime.request_close()
+                    exit_code = await asyncio.shield(runtime.wait_for_exit())
+                    await runtime.close_connection()
+                if exit_code != 0:
+                    raise BrowserExitedError(f"Chrome exited with status {exit_code}")
+                async with asyncio.timeout(self._config.timeouts.shutdown):
+                    await self._state.confirm_shutdown(
+                        lease,
+                        CleanShutdownProof(
+                            episode_id=lease.episode_id,
+                            process_id=runtime.process_id,
+                            exit_code=exit_code,
+                        ),
+                    )
+                    checkpoint = await self._state.checkpoint(lease, reason)
+                self._restore_authority = checkpoint
+            except BaseException as error:
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                terminal_error: BaseException = (
+                    BrowserShutdownError("Chrome checkpoint shutdown timed out")
+                    if isinstance(error, TimeoutError)
+                    else error
+                )
+                with suppress(Exception):
+                    await self._force_stop(runtime)
+                await self._abort_episode(lease, terminal_error)
+                self._fatal_error = terminal_error
+                self._lifecycle = SessionLifecycle.CLOSED
+                raise terminal_error from error
+
+            successor: EpisodeLease | None = None
+            successor_runtime: OwnedBrowser | None = None
+            try:
+                successor = await self._state.open_episode(checkpoint, self._policy, metadata)
+                profile = self._state._profile_directory(  # pyright: ignore[reportPrivateUsage]
+                    successor
+                )
+                async with asyncio.timeout(self._config.timeouts.launch):
+                    successor_runtime = await self._launcher.launch(
+                        self._config, profile, self._metadata_or_fail()
+                    )
+            except BaseException as error:
+                if successor_runtime is not None:
+                    with suppress(Exception):
+                        await self._force_stop(successor_runtime)
+                if successor is not None:
+                    await self._abort_episode(successor, error)
+                self._fatal_error = error
+                self._lifecycle = SessionLifecycle.CLOSED
+                raise
+
+            self._lease = successor
+            self._runtime = successor_runtime
+            self._last_observation = None
+            self._last_state_delta = None
+            self._monitor = asyncio.create_task(
+                self._monitor_runtime(), name=f"browser-{successor.episode_id}"
+            )
+            return checkpoint
+
+    def _metadata_or_fail(self) -> BrowserMetadata:
+        if self._metadata is None:
+            raise SessionStateError("session has no browser metadata")
+        return self._metadata
 
     async def _cleanup_failed_start(self, error: BaseException) -> None:
         cleanup_verified = not isinstance(error, BrowserShutdownError)

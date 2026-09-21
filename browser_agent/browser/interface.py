@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from .models import (
     ActionResult,
@@ -12,6 +12,9 @@ from .models import (
     Observation,
     SessionLifecycle,
 )
+
+if TYPE_CHECKING:
+    from ..state.models import CheckpointRef
 
 
 @runtime_checkable
@@ -31,10 +34,18 @@ class BrowserSession(Protocol):
     @property
     def fatal_error(self) -> BaseException | None: ...
 
+    @property
+    def restore_authority(self) -> CheckpointRef | None: ...
+
+    @property
+    def compatibility_warnings(self) -> tuple[str, ...]: ...
+
     async def start(self) -> None: ...
 
     async def observe(self) -> Observation: ...
 
     async def execute(self, action: BrowserAction) -> ActionResult: ...
+
+    async def checkpoint(self, reason: str) -> CheckpointRef: ...
 
     async def close(self) -> None: ...

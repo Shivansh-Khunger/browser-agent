@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import shutil
 import tarfile
 from dataclasses import asdict
@@ -17,10 +18,14 @@ from .models import (
     ArtifactRef,
     CapturePolicy,
     CheckpointError,
+    CheckpointRef,
     CleanShutdownProof,
     EpisodeMetadata,
     SecurityClass,
 )
+
+CHECKPOINT_SCHEMA_VERSION = 1
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def archive_profile(
@@ -82,7 +87,7 @@ def encode_manifest(
     shutdown: CleanShutdownProof,
 ) -> bytes:
     manifest = {
-        "schema_version": 1,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "episode_id": episode_id,
         "parent_id": parent_id,
         "reason": reason,
@@ -104,6 +109,9 @@ def encode_manifest(
             "restricted_storage": policy.restricted_storage,
             "optional_artifacts": sorted(item.value for item in policy.optional_artifacts),
             "retention_labels": list(policy.retention_labels),
+            "incompatible_nodriver_transitions": [
+                list(item) for item in sorted(policy.incompatible_nodriver_transitions)
+            ],
         },
         "metadata": asdict(metadata),
     }
@@ -116,6 +124,90 @@ def decode_manifest(data: bytes) -> dict[str, object]:
     except Exception as error:
         raise CheckpointError("checkpoint manifest cannot be read") from error
     return _object_dict(raw, "checkpoint manifest is not an object")
+
+
+def validate_manifest(
+    manifest: dict[str, object],
+    checkpoint: CheckpointRef,
+    policy: CapturePolicy,
+    metadata: EpisodeMetadata,
+) -> tuple[str, ...]:
+    """Validate restore authority and current-runtime compatibility."""
+    if _integer(manifest.get("schema_version")) != CHECKPOINT_SCHEMA_VERSION:
+        raise CheckpointError("checkpoint schema version is unsupported")
+    if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION:
+        raise CheckpointError("checkpoint reference schema version is unsupported")
+    if checkpoint.manifest is None or checkpoint.checkpoint_id != checkpoint.manifest.content_id:
+        raise CheckpointError("checkpoint reference does not identify its manifest")
+    if (
+        checkpoint.manifest.kind is not ArtifactKind.CHECKPOINT
+        or checkpoint.manifest.security_class is not SecurityClass.RESTRICTED
+        or checkpoint.manifest.media_type != "application/json"
+        or checkpoint.manifest.schema_version != CHECKPOINT_SCHEMA_VERSION
+    ):
+        raise CheckpointError("checkpoint manifest is not encrypted restore authority")
+
+    episode_id = _required_string(manifest.get("episode_id"), "checkpoint episode is invalid")
+    parent_id = _optional_string(manifest.get("parent_id"))
+    reason = _required_string(manifest.get("reason"), "checkpoint reason is invalid")
+    if (episode_id, parent_id, reason) != (
+        checkpoint.episode_id,
+        checkpoint.parent_id,
+        checkpoint.reason,
+    ):
+        raise CheckpointError("checkpoint reference does not match manifest lineage")
+    if not checkpoint.clean_shutdown or not _boolean(manifest.get("clean_shutdown")):
+        raise CheckpointError("checkpoint lacks clean shutdown authority")
+    proof = _object_dict(
+        manifest.get("clean_shutdown_proof"), "checkpoint shutdown proof is invalid"
+    )
+    if (
+        _required_string(proof.get("episode_id"), "checkpoint shutdown proof is invalid")
+        != episode_id
+        or _integer(proof.get("process_id")) <= 0
+        or _integer(proof.get("exit_code")) != 0
+    ):
+        raise CheckpointError("checkpoint shutdown proof is invalid")
+
+    profile = profile_reference(manifest)
+    if (
+        profile.kind is not ArtifactKind.CHECKPOINT
+        or profile.security_class is not SecurityClass.RESTRICTED
+        or profile.media_type != "application/x-tar"
+        or profile.schema_version != CHECKPOINT_SCHEMA_VERSION
+    ):
+        raise CheckpointError("checkpoint profile is not encrypted restore authority")
+    _validated_files(manifest.get("files"))
+
+    writer = metadata_from_manifest(manifest)
+    if _platform_family(writer.platform) != _platform_family(metadata.platform):
+        raise CheckpointError("checkpoint platform is incompatible")
+    writer_major = _browser_major(writer.browser_version)
+    current_major = _browser_major(metadata.browser_version)
+    if writer_major is not None and current_major is None:
+        raise CheckpointError("current browser version cannot be validated")
+    if writer_major is not None and current_major is not None and current_major < writer_major:
+        raise CheckpointError("browser downgrade cannot restore checkpoint")
+
+    warnings: list[str] = []
+    transition = (writer.nodriver_version or "", metadata.nodriver_version or "")
+    if all(transition) and transition[0] != transition[1]:
+        if transition in policy.incompatible_nodriver_transitions:
+            raise CheckpointError("nodriver version transition is configured incompatible")
+        warnings.append(f"nodriver_version_changed:{transition[0]}->{transition[1]}")
+    return tuple(warnings)
+
+
+def verify_materialized_profile(root: Path, manifest: dict[str, object]) -> None:
+    expected = _validated_files(manifest.get("files"))
+    actual = {
+        path.relative_to(root).as_posix(): (len(data), hashlib.sha256(data).hexdigest())
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+        for data in (path.read_bytes(),)
+    }
+    if actual != expected:
+        raise CheckpointError("checkpoint profile does not match file manifest")
 
 
 def profile_reference(manifest: dict[str, object]) -> ArtifactRef:
@@ -157,6 +249,13 @@ def policy_from_manifest(manifest: dict[str, object]) -> CapturePolicy:
             restricted_storage=_boolean(value["restricted_storage"]),
             retention_labels=tuple(
                 _string_list(value.get("retention_labels"), "checkpoint policy is invalid")
+            ),
+            incompatible_nodriver_transitions=frozenset(
+                _version_transition(item)
+                for item in _object_list(
+                    value.get("incompatible_nodriver_transitions"),
+                    "checkpoint policy is invalid",
+                )
             ),
         )
     except (KeyError, TypeError, ValueError) as error:
@@ -220,6 +319,14 @@ def _object_dict(value: object, message: str) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
+def _object_list(value: object, message: str) -> list[object]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise CheckpointError(message)
+    return cast(list[object], value)
+
+
 def _string_list(value: object, message: str) -> list[str]:
     if value is None:
         return []
@@ -237,6 +344,52 @@ def _optional_string(value: object) -> str | None:
     if not isinstance(value, str):
         raise CheckpointError("checkpoint metadata is invalid")
     return value
+
+
+def _required_string(value: object, message: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise CheckpointError(message)
+    return value
+
+
+def _version_transition(value: object) -> tuple[str, str]:
+    if not isinstance(value, list):
+        raise CheckpointError("checkpoint policy is invalid")
+    items = cast(list[object], value)
+    if len(items) != 2 or not all(isinstance(item, str) and item for item in items):
+        raise CheckpointError("checkpoint policy is invalid")
+    return cast(str, items[0]), cast(str, items[1])
+
+
+def _validated_files(value: object) -> dict[str, tuple[int, str]]:
+    files: dict[str, tuple[int, str]] = {}
+    for raw in _object_list(value, "checkpoint file manifest is invalid"):
+        item = _object_dict(raw, "checkpoint file manifest is invalid")
+        path = _required_string(item.get("path"), "checkpoint file manifest is invalid")
+        relative = PurePosixPath(path)
+        size = _integer(item.get("bytes"))
+        digest = _required_string(item.get("sha256"), "checkpoint file manifest is invalid")
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or path in files
+            or size < 0
+            or not _SHA256.fullmatch(digest)
+        ):
+            raise CheckpointError("checkpoint file manifest is invalid")
+        files[path] = (size, digest)
+    return files
+
+
+def _platform_family(value: str) -> str:
+    return value.split("-", 1)[0].lower()
+
+
+def _browser_major(value: str | None) -> int | None:
+    if value is None:
+        return None
+    match = re.search(r"\d+", value)
+    return int(match.group()) if match else None
 
 
 def _integer(value: object) -> int:

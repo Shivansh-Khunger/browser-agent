@@ -10,6 +10,8 @@ Nodriver transport remains internal. Callers depend on package exports, never
 transport or backend identities.
 """
 
+from typing import TYPE_CHECKING, Any
+
 from .interface import BrowserSession
 from .models import (
     ActionResult,
@@ -38,7 +40,18 @@ from .models import (
     UnsupportedRegion,
     Viewport,
 )
-from .nodriver_session import NodriverSession
+
+if TYPE_CHECKING:
+    from .nodriver_session import NodriverSession
+
+
+def __getattr__(name: str) -> Any:
+    if name == "NodriverSession":
+        from .nodriver_session import NodriverSession
+
+        return NodriverSession
+    raise AttributeError(name)
+
 
 __all__ = [
     "ActionResult",

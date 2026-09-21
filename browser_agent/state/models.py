@@ -112,6 +112,7 @@ class EpisodeLease:
     lease_id: str
     episode_id: str
     parent_checkpoint_id: str | None = None
+    compatibility_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,12 +138,18 @@ class CapturePolicy:
     capture_timeout: float = 5.0
     restricted_storage: bool = False
     retention_labels: tuple[str, ...] = ()
+    incompatible_nodriver_transitions: frozenset[tuple[str, str]] = frozenset()
 
     def __post_init__(self) -> None:
         if self.max_queue_items <= 0 or self.max_artifact_bytes <= 0:
             raise ValueError("capture bounds must be greater than zero")
         if self.capture_timeout <= 0:
             raise ValueError("capture timeout must be greater than zero")
+        if any(
+            len(transition) != 2 or not all(transition)
+            for transition in self.incompatible_nodriver_transitions
+        ):
+            raise ValueError("nodriver incompatibility transitions require two versions")
 
 
 @dataclass(frozen=True, slots=True)

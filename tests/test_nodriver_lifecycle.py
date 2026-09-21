@@ -112,6 +112,24 @@ class FailingCaptureState(ProfileStateAdapter):
         raise OSError("injected capture failure")
 
 
+class SequenceLauncher(FakeBrowserLauncher):
+    def __init__(self, *runtimes: FakeOwnedBrowser, fail_launch: int | None = None) -> None:
+        super().__init__(runtimes[0])
+        self.runtimes = list(runtimes)
+        self.fail_launch = fail_launch
+        self.launch_count = 0
+        self.launched_profiles: list[Path] = []
+
+    async def launch(self, config, profile, metadata):  # type: ignore[no-untyped-def]
+        del config, metadata
+        self.launched_profiles.append(profile)
+        index = self.launch_count
+        self.launch_count += 1
+        if self.fail_launch == index:
+            raise RuntimeError("injected rollover launch failure")
+        return self.runtimes[index]
+
+
 def policy() -> CapturePolicy:
     return CapturePolicy("v1", "redaction-v1", restricted_storage=True)
 
@@ -153,6 +171,51 @@ async def test_session_launches_owned_profile_records_metadata_and_closes_once(t
 
     with pytest.raises(SessionStateError, match="cannot start from closed"):
         await session.start()
+
+
+@pytest.mark.asyncio
+async def test_explicit_checkpoint_rolls_over_and_preserves_lineage(tmp_path) -> None:
+    state = ProfileStateAdapter(tmp_path)
+    first_runtime = FakeOwnedBrowser()
+    second_runtime = FakeOwnedBrowser()
+    launcher = SequenceLauncher(first_runtime, second_runtime)
+    session = NodriverSession(
+        BrowserConfig(), state, policy(), episode_metadata(), launcher=launcher
+    )
+    await session.start()
+
+    checkpoint = await session.checkpoint("operator-request")
+
+    assert session.lifecycle is SessionLifecycle.RUNNING
+    assert session.restore_authority == checkpoint
+    assert first_runtime.close_requests == 1
+    assert first_runtime.connection_closes == 1
+    assert len(launcher.launched_profiles) == 2
+    await session.execute(BrowserAction("after-rollover"))
+    await session.close()
+    assert session.terminal_checkpoint is not None
+    assert session.terminal_checkpoint.parent_id == checkpoint.checkpoint_id
+    assert session.restore_authority == session.terminal_checkpoint
+    assert second_runtime.close_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_rollover_relaunch_failure_retains_last_valid_restore_authority(tmp_path) -> None:
+    state = ProfileStateAdapter(tmp_path)
+    first_runtime = FakeOwnedBrowser()
+    launcher = SequenceLauncher(first_runtime, fail_launch=1)
+    session = NodriverSession(
+        BrowserConfig(), state, policy(), episode_metadata(), launcher=launcher
+    )
+    await session.start()
+
+    with pytest.raises(RuntimeError, match="injected rollover launch failure"):
+        await session.checkpoint("before-failure")
+
+    assert session.lifecycle is SessionLifecycle.CLOSED
+    assert session.restore_authority is not None
+    assert session.restore_authority.reason == "before-failure"
+    assert len(state.aborted_with) == 1
 
 
 @pytest.mark.asyncio

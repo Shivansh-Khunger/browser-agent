@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -327,3 +328,119 @@ async def test_manifest_publication_failure_keeps_only_encrypted_quarantine(tmp_
     assert diagnostic["profile_retained"] is True
     assert diagnostic["quarantined_profile"]["content_id"].startswith("hmac-sha256:")
     assert all(secret not in path.read_bytes() for path in tmp_path.rglob("*") if path.is_file())
+
+
+@pytest.mark.asyncio
+async def test_restore_validates_lineage_clean_shutdown_and_browser_compatibility(tmp_path) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    adapter = LocalBrowserStateAdapter(tmp_path / "state", store)
+    policy = CapturePolicy("capture-v1", "redaction-v1", restricted_storage=True)
+    writer = EpisodeMetadata(
+        code_revision="writer",
+        platform="Linux-writer",
+        browser_version="Chrome 140.0.0.0",
+        nodriver_version="0.50.3",
+    )
+    lease = await adapter.open_episode(None, policy, writer)
+    (adapter._profile_directory(lease) / "Cookies").write_bytes(b"restore-fidelity")
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
+    checkpoint = await adapter.checkpoint(lease, "explicit")
+
+    current = replace(writer, code_revision="reader", browser_version="Chrome 141.0.0.0")
+    restored = await adapter.open_episode(checkpoint, policy, current)
+    assert (adapter._profile_directory(restored) / "Cookies").read_bytes() == b"restore-fidelity"
+    await adapter.abort_episode(restored, RuntimeError("cleanup"))
+
+    with pytest.raises(CheckpointError, match="downgrade"):
+        await adapter.open_episode(
+            checkpoint, policy, replace(current, browser_version="Chrome 139.0.0.0")
+        )
+    with pytest.raises(CheckpointError, match="lineage"):
+        await adapter.open_episode(replace(checkpoint, reason="forged"), policy, current)
+    with pytest.raises(CheckpointError, match="clean shutdown"):
+        await adapter.open_episode(replace(checkpoint, clean_shutdown=False), policy, current)
+    with pytest.raises(CheckpointError, match="schema version"):
+        await adapter.open_episode(replace(checkpoint, schema_version=2), policy, current)
+    with pytest.raises(CheckpointError, match="platform"):
+        await adapter.open_episode(checkpoint, policy, replace(current, platform="Darwin-reader"))
+
+
+@pytest.mark.asyncio
+async def test_restore_warns_or_rejects_nodriver_version_transition(tmp_path) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    adapter = LocalBrowserStateAdapter(tmp_path / "state", store)
+    writer_policy = CapturePolicy("capture-v1", "redaction-v1", restricted_storage=True)
+    writer = EpisodeMetadata(
+        code_revision="writer",
+        platform="Linux-writer",
+        browser_version="Chrome 140.0.0.0",
+        nodriver_version="0.50.3",
+    )
+    lease = await adapter.open_episode(None, writer_policy, writer)
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
+    checkpoint = await adapter.checkpoint(lease, "explicit")
+    current = replace(writer, nodriver_version="0.51.0")
+
+    restored = await adapter.open_episode(checkpoint, writer_policy, current)
+    assert restored.compatibility_warnings == ("nodriver_version_changed:0.50.3->0.51.0",)
+    await adapter.abort_episode(restored, RuntimeError("cleanup"))
+
+    rejecting_policy = replace(
+        writer_policy,
+        incompatible_nodriver_transitions=frozenset({("0.50.3", "0.51.0")}),
+    )
+    with pytest.raises(CheckpointError, match="configured incompatible"):
+        await adapter.open_episode(checkpoint, rejecting_policy, current)
+
+
+@pytest.mark.asyncio
+async def test_branch_profiles_are_independent_and_source_remains_immutable(tmp_path) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    adapter = LocalBrowserStateAdapter(tmp_path / "state", store)
+    policy = CapturePolicy("capture-v1", "redaction-v1", restricted_storage=True)
+    metadata = EpisodeMetadata(code_revision="writer", platform="test")
+    lease = await adapter.open_episode(None, policy, metadata)
+    (adapter._profile_directory(lease) / "Cookies").write_bytes(b"parent")
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
+    checkpoint = await adapter.checkpoint(lease, "branch-source")
+
+    first, second = await adapter.branch(checkpoint, 2)
+    (adapter._profile_directory(first) / "Cookies").write_bytes(b"first")
+
+    assert (adapter._profile_directory(second) / "Cookies").read_bytes() == b"parent"
+    third = await adapter.restore(checkpoint)
+    assert (adapter._profile_directory(third) / "Cookies").read_bytes() == b"parent"
+    assert len({first.episode_id, second.episode_id, third.episode_id}) == 3
+    for child in (first, second, third):
+        await adapter.abort_episode(child, RuntimeError("cleanup"))
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_profile_that_disagrees_with_file_manifest(tmp_path) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts", encryption_key=b"k" * 32)
+    adapter = LocalBrowserStateAdapter(tmp_path / "state", store)
+    policy = CapturePolicy("capture-v1", "redaction-v1", restricted_storage=True)
+    metadata = EpisodeMetadata(code_revision="writer", platform="test")
+    lease = await adapter.open_episode(None, policy, metadata)
+    (adapter._profile_directory(lease) / "Cookies").write_bytes(b"profile")
+    await adapter.confirm_shutdown(lease, clean_shutdown(lease.episode_id))
+    checkpoint = await adapter.checkpoint(lease, "explicit")
+    assert checkpoint.manifest is not None
+    manifest = json.loads((await store.get(checkpoint.manifest)).decode())
+    manifest["files"][0]["sha256"] = "0" * 64
+    forged_manifest = await store.put(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode(),
+        kind=ArtifactKind.CHECKPOINT,
+        media_type="application/json",
+        schema_version=1,
+        security_class=SecurityClass.RESTRICTED,
+        redaction_policy_version="redaction-v1",
+    )
+    forged = replace(
+        checkpoint,
+        checkpoint_id=forged_manifest.content_id,
+        manifest=forged_manifest,
+    )
+
+    with pytest.raises(CheckpointError, match="file manifest"):
+        await adapter.restore(forged)

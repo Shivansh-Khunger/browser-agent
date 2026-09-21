@@ -34,6 +34,8 @@ from .checkpoints import (
     metadata_from_manifest,
     policy_from_manifest,
     profile_reference,
+    validate_manifest,
+    verify_materialized_profile,
 )
 from .models import (
     ActionCapture,
@@ -94,11 +96,14 @@ class LocalBrowserStateAdapter:
     ) -> EpisodeLease:
         source = self._baseline
         temporary_source: Path | None = None
+        warnings: tuple[str, ...] = ()
         if seed_checkpoint is not None:
-            temporary_source = await self._materialize_checkpoint(seed_checkpoint)
+            temporary_source, warnings = await self._materialize_checkpoint(
+                seed_checkpoint, policy, metadata
+            )
             source = temporary_source
         try:
-            return self._clone_episode(source, seed_checkpoint, policy, metadata)
+            return self._clone_episode(source, seed_checkpoint, policy, metadata, warnings)
         finally:
             if temporary_source is not None:
                 shutil.rmtree(temporary_source, ignore_errors=True)
@@ -344,7 +349,23 @@ class LocalBrowserStateAdapter:
     async def branch(self, checkpoint: CheckpointRef, count: int) -> list[EpisodeLease]:
         if count < 1:
             raise ValueError("branch count must be greater than zero")
-        return [await self.restore(checkpoint) for _ in range(count)]
+        manifest = await self._load_manifest(checkpoint)
+        policy = policy_from_manifest(manifest)
+        metadata = metadata_from_manifest(manifest)
+        source, warnings = await self._materialize_checkpoint(checkpoint, policy, metadata)
+        leases: list[EpisodeLease] = []
+        try:
+            for _ in range(count):
+                leases.append(self._clone_episode(source, checkpoint, policy, metadata, warnings))
+        except BaseException:
+            for lease in leases:
+                episode = self._open.pop(lease.lease_id, None)
+                if episode is not None:
+                    shutil.rmtree(episode.directory, ignore_errors=True)
+            raise
+        finally:
+            shutil.rmtree(source, ignore_errors=True)
+        return leases
 
     async def _finish_capture_slot(self, capture: ActionCapture) -> None:
         self._captures.pop(capture.capture_id, None)
@@ -467,9 +488,15 @@ class LocalBrowserStateAdapter:
         seed: CheckpointRef | None,
         policy: CapturePolicy,
         metadata: EpisodeMetadata,
+        warnings: tuple[str, ...] = (),
     ) -> EpisodeLease:
         episode_id = uuid4().hex
-        lease = EpisodeLease(uuid4().hex, episode_id, seed.checkpoint_id if seed else None)
+        lease = EpisodeLease(
+            uuid4().hex,
+            episode_id,
+            seed.checkpoint_id if seed else None,
+            warnings,
+        )
         directory = self._episodes / episode_id
         profile = directory / "profile"
         directory.mkdir(mode=0o700)
@@ -616,26 +643,34 @@ class LocalBrowserStateAdapter:
         finally:
             temporary.unlink(missing_ok=True)
 
-    async def _materialize_checkpoint(self, checkpoint: CheckpointRef) -> Path:
+    async def _materialize_checkpoint(
+        self,
+        checkpoint: CheckpointRef,
+        policy: CapturePolicy,
+        metadata: EpisodeMetadata,
+    ) -> tuple[Path, tuple[str, ...]]:
         manifest = await self._load_manifest(checkpoint)
+        warnings = validate_manifest(manifest, checkpoint, policy, metadata)
         profile = profile_reference(manifest)
-        archive = await self._artifacts.get(profile)
         destination = self._root / f"restore-{uuid4().hex}"
         destination.mkdir(mode=0o700)
         try:
+            archive = await self._artifacts.get(profile)
             extract_profile(archive, destination)
+            verify_materialized_profile(destination, manifest)
         except BaseException:
             shutil.rmtree(destination, ignore_errors=True)
             raise
-        return destination
+        return destination, warnings
 
     async def _load_manifest(self, checkpoint: CheckpointRef) -> dict[str, object]:
         if checkpoint.manifest is None:
             raise CheckpointError("checkpoint has no manifest")
         try:
-            return decode_manifest(await self._artifacts.get(checkpoint.manifest))
+            manifest = decode_manifest(await self._artifacts.get(checkpoint.manifest))
         except Exception as error:
             raise CheckpointError("checkpoint manifest cannot be read") from error
+        return manifest
 
     def _require_open(self, lease: EpisodeLease) -> _Episode:
         episode = self._open.get(lease.lease_id)
