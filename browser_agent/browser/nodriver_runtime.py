@@ -19,6 +19,7 @@ import nodriver
 from nodriver import cdp
 from nodriver.core.browser import Browser
 from nodriver.core.config import Config, find_chrome_executable
+from nodriver.core.tab import Tab
 
 from .models import (
     ActionResult,
@@ -73,7 +74,10 @@ class NodriverLauncher:
                 user_data_dir=profile,
                 headless=config.headless,
                 browser_executable_path=metadata.executable,
-                browser_args=[f"--lang={config.locale}"] if config.locale else [],
+                browser_args=[
+                    "--disable-popup-blocking",
+                    *([f"--lang={config.locale}"] if config.locale else []),
+                ],
                 lang=config.locale,
             )
             browser = Browser(nodriver_config)
@@ -104,7 +108,14 @@ class NodriverOwnedBrowser:
         self._browser = browser
         self._config = config
         self._process = process
-        self._launch_target_id = _target_id(browser)
+        self._launch_tab = browser.main_tab
+        self._launch_target_id = _tab_target_id(self._launch_tab)
+        self._active_tab = self._launch_tab
+        self._active_target_id = self._launch_target_id
+        self._target_openers: dict[str, str | None] = {
+            self._launch_target_id: _tab_opener_id(self._launch_tab)
+        }
+        self._adoption_order: list[str] = []
         self._observation_count = 0
         self._current_observation_id: str | None = None
         self._current_screenshot: ScreenshotMetadata | None = None
@@ -113,7 +124,7 @@ class NodriverOwnedBrowser:
         self._control_semantics: dict[str, SemanticControl] = {}
         self._redacted_backend_node_ids: set[object] = set()
         self._redaction_tokens: set[str] = set()
-        self._frames = FrameRegistry(browser.main_tab)
+        self._frames = FrameRegistry(self._active_tab)
 
     @property
     def process_id(self) -> int:
@@ -121,17 +132,17 @@ class NodriverOwnedBrowser:
 
     @property
     def active_target_id(self) -> str | None:
-        return self._launch_target_id
+        return self._active_target_id
 
     async def observe(self) -> Observation:
-        self._require_active_tab()
+        await self._repair_active_tab()
         self._observation_count += 1
         observation_id = f"obs-{self._observation_count}"
         frame_root = await self._frames.reconcile()
         capture = await capture_observation(
-            self._browser.main_tab,
+            self._active_tab,
             observation_id=observation_id,
-            active_target_id=self._launch_target_id,
+            active_target_id=self._active_target_id,
             frame_root=frame_root,
             limits=self._config.observation_limits,
         )
@@ -192,7 +203,8 @@ class NodriverOwnedBrowser:
         return observation
 
     async def execute(self, action: BrowserAction) -> ActionResult:
-        self._require_active_tab()
+        before = await self._repair_active_tab()
+        source_target_id = self._active_target_id
         if action.name == "navigate":
             result = await self._execute_navigate(action)
         elif action.name == "click":
@@ -223,15 +235,15 @@ class NodriverOwnedBrowser:
             result = await self._execute_evaluate(action)
         else:
             raise BrowserEvaluationError(f"unsupported browser action: {action.name!r}")
-        self._require_active_tab()
+        ambiguity = await self._reconcile_action_targets(before, source_target_id, result)
         observation = await self.observe()
-        return replace(result, observation=observation)
+        return replace(ambiguity or result, observation=observation)
 
     async def _execute_navigate(self, action: BrowserAction) -> ActionResult:
         url = action.arguments.get("url")
         if not isinstance(url, str):
             raise ValueError("navigate requires a string 'url' argument")
-        result = await navigate(self._browser.main_tab, self._config, url)
+        result = await navigate(self._active_tab, self._config, url)
         return result
 
     async def _execute_click(self, action: BrowserAction) -> ActionResult:
@@ -385,9 +397,9 @@ class NodriverOwnedBrowser:
         direction = action.arguments.get("direction")
         if direction not in {"up", "down"}:
             return _failed_action("invalid_arguments", "scroll direction must be 'up' or 'down'")
-        viewport = await read_viewport(self._browser.main_tab)
+        viewport = await read_viewport(self._active_tab)
         delta = viewport.height * (0.9 if direction == "down" else -0.9)
-        await self._browser.main_tab.send(
+        await self._active_tab.send(
             cdp.input_.dispatch_mouse_event(
                 "mouseWheel", x=viewport.width / 2, y=viewport.height / 2, delta_y=delta
             )
@@ -396,12 +408,10 @@ class NodriverOwnedBrowser:
         return ActionResult(OutcomeStatus.SUCCEEDED, f"scrolled {direction}")
 
     async def _execute_back(self) -> ActionResult:
-        current_index, entries = await self._browser.main_tab.send(
-            cdp.page.get_navigation_history()
-        )
+        current_index, entries = await self._active_tab.send(cdp.page.get_navigation_history())
         if current_index <= 0 or not entries:
             return _failed_action("history_empty", "no previous page is available")
-        await self._browser.main_tab.send(
+        await self._active_tab.send(
             cdp.page.navigate_to_history_entry(entries[current_index - 1].id_)
         )
         await asyncio.sleep(self._config.timeouts.settle)
@@ -430,7 +440,7 @@ class NodriverOwnedBrowser:
         )
 
     async def _evaluate_read(self, expression: str, message: str, detail_name: str) -> ActionResult:
-        result, exception = await self._browser.main_tab.send(
+        result, exception = await self._active_tab.send(
             # This expression is adapter-owned and operates on a detached clone
             # when it needs DOM cleanup; V8 otherwise rejects it as a possible
             # side effect despite no mutation of the active document.
@@ -444,7 +454,7 @@ class NodriverOwnedBrowser:
         )
 
     async def _execute_screenshot(self) -> ActionResult:
-        data = await self._browser.main_tab.send(
+        data = await self._active_tab.send(
             cdp.page.capture_screenshot(
                 format_="png", from_surface=True, capture_beyond_viewport=False
             )
@@ -456,7 +466,7 @@ class NodriverOwnedBrowser:
         )
 
     async def _execute_viewport(self) -> ActionResult:
-        viewport = await read_viewport(self._browser.main_tab)
+        viewport = await read_viewport(self._active_tab)
         return ActionResult(
             OutcomeStatus.SUCCEEDED,
             "viewport read completed",
@@ -478,7 +488,7 @@ class NodriverOwnedBrowser:
             return _failed_action(
                 "invalid_arguments", "evaluate requires a string 'expression' argument"
             )
-        result, exception = await self._browser.main_tab.send(
+        result, exception = await self._active_tab.send(
             cdp.runtime.evaluate(
                 expression,
                 return_by_value=True,
@@ -511,11 +521,11 @@ class NodriverOwnedBrowser:
         screenshot = self._current_screenshot
         if screenshot is None or screenshot_id != screenshot.screenshot_id:
             raise StaleTargetError("screenshot is missing, mismatched, or stale")
-        if screenshot.active_target_id != self._launch_target_id:
+        if screenshot.active_target_id != self._active_target_id:
             raise StaleTargetError("screenshot belongs to a stale browser target")
         if frame_generations(await self._frames.reconcile()) != self._current_frame_generations:
             raise StaleTargetError("screenshot belongs to stale frame documents")
-        if await read_viewport(self._browser.main_tab) != screenshot.viewport:
+        if await read_viewport(self._active_tab) != screenshot.viewport:
             raise StaleTargetError("screenshot viewport changed; take a fresh observation")
         x = _finite_coordinate(action.arguments.get("x"), "x")
         y = _finite_coordinate(action.arguments.get("y"), "y")
@@ -525,11 +535,91 @@ class NodriverOwnedBrowser:
             raise ValueError("click_at coordinates must be inside the screenshot viewport")
         css_x = x * screenshot.viewport.width / width
         css_y = y * screenshot.viewport.height / height
-        return await click_at(self._browser.main_tab, css_x, css_y, self._config.timeouts)
+        return await click_at(self._active_tab, css_x, css_y, self._config.timeouts)
 
-    def _require_active_tab(self) -> None:
-        if _target_id(self._browser) != self._launch_target_id:
-            raise ClosedTargetError("the owned tab is no longer the active target")
+    async def _page_tabs(self) -> dict[str, Tab]:
+        await self._browser.update_targets()
+        tabs = {_tab_target_id(cast(Tab, tab)): cast(Tab, tab) for tab in self._browser.tabs}
+        for target_id, tab in tabs.items():
+            self._target_openers[target_id] = _tab_opener_id(tab)
+        return tabs
+
+    async def _repair_active_tab(self) -> dict[str, Tab]:
+        tabs = await self._page_tabs()
+        current = tabs.get(self._active_target_id)
+        if current is not None:
+            self._active_tab = current
+            return tabs
+
+        opener_id = self._target_openers.get(self._active_target_id)
+        fallback_ids = (
+            ([opener_id] if opener_id is not None else [])
+            + list(reversed(self._adoption_order))
+            + [self._launch_target_id]
+        )
+        for target_id in fallback_ids:
+            tab = tabs.get(target_id)
+            if tab is not None:
+                await self._set_active_tab(tab, adopted=False)
+                return tabs
+        raise ClosedTargetError("active tab closed and no owned fallback tab survives")
+
+    async def _reconcile_action_targets(
+        self,
+        before: dict[str, Tab],
+        source_target_id: str,
+        action_result: ActionResult,
+    ) -> ActionResult | None:
+        after = await self._page_tabs()
+        candidates = sorted(set(after) - set(before))
+        if len(candidates) == 1:
+            await self._set_active_tab(after[candidates[0]], adopted=True)
+            return None
+        if len(candidates) > 1:
+            # Chrome may foreground one new tab, but inventory order and browser
+            # focus are not ownership signals. Keep the logical active tab.
+            if source_target_id in after:
+                await after[source_target_id].activate()
+                self._active_tab = after[source_target_id]
+                self._active_target_id = source_target_id
+            else:
+                await self._repair_active_tab()
+            details = tuple(_target_details(after[target_id]) for target_id in candidates)
+            return ActionResult(
+                OutcomeStatus.UNCERTAIN,
+                "browser action created multiple plausible child tabs; active tab was retained",
+                error_code="ambiguous_target",
+                retryable=False,
+                details={
+                    "candidates": details,
+                    "candidate_count": len(details),
+                    "action_status": action_result.status.value,
+                    "action_message": action_result.message,
+                },
+            )
+        await self._repair_active_tab()
+        return None
+
+    async def _set_active_tab(self, tab: Tab, *, adopted: bool) -> None:
+        target_id = _tab_target_id(tab)
+        await tab.activate()
+        if target_id == self._active_target_id:
+            self._active_tab = tab
+            return
+        await self._frames.close()
+        self._active_tab = tab
+        self._active_target_id = target_id
+        self._frames = FrameRegistry(tab)
+        self._current_observation_id = None
+        self._current_screenshot = None
+        self._current_frame_generations = {}
+        self._control_index = {}
+        self._control_semantics = {}
+        if adopted:
+            self._adoption_order = [
+                adopted_id for adopted_id in self._adoption_order if adopted_id != target_id
+            ]
+            self._adoption_order.append(target_id)
 
     async def wait_for_failure(self) -> RuntimeFailure:
         process_wait = asyncio.create_task(self._process.wait())
@@ -578,9 +668,24 @@ class NodriverOwnedBrowser:
         await _terminate_process(self._process, timeout)
 
 
-def _target_id(browser: Browser) -> str:
-    target = cast(Any, browser.main_tab.target)
+def _tab_target_id(tab: Tab) -> str:
+    target = cast(Any, tab.target)
     return str(getattr(target, "target_id", target))
+
+
+def _tab_opener_id(tab: Tab) -> str | None:
+    opener_id = getattr(cast(Any, tab.target), "opener_id", None)
+    return str(opener_id) if opener_id is not None else None
+
+
+def _target_details(tab: Tab) -> dict[str, object]:
+    target = cast(Any, tab.target)
+    return {
+        "target_id": _tab_target_id(tab),
+        "url": str(getattr(target, "url", "")),
+        "title": str(getattr(target, "title", "")),
+        "opener_id": _tab_opener_id(tab),
+    }
 
 
 def _finite_coordinate(value: object, name: str) -> float:
