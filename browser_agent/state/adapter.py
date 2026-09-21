@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 from ..browser.models import ActionResult, Observation
 from .models import (
     ActionCapture,
+    ActionEvidence,
     ActionRequest,
     CapturePolicy,
     CheckpointRef,
@@ -37,6 +38,7 @@ class BrowserStateAdapter(Protocol):
         capture: ActionCapture,
         result: ActionResult,
         observation: Observation | None,
+        evidence: ActionEvidence | None = None,
     ) -> StateDelta: ...
 
     async def confirm_shutdown(self, lease: EpisodeLease, proof: CleanShutdownProof) -> None: ...

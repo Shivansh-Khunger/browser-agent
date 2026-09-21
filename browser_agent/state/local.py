@@ -2,16 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from ..browser.models import ActionResult, Observation
+from ..browser.models import ActionResult, BrowserAction, Observation
 from .artifacts import ArtifactStore
+from .capture import (
+    canonical_json,
+    observation_digest,
+    observation_payload,
+    redact_action_input,
+    redact_network_event,
+    redact_result,
+    redact_storage_event,
+    redact_url,
+    utc_now,
+)
 from .checkpoints import (
     archive_profile,
     artifact_to_dict,
@@ -24,6 +37,7 @@ from .checkpoints import (
 )
 from .models import (
     ActionCapture,
+    ActionEvidence,
     ActionRequest,
     ArtifactKind,
     ArtifactRef,
@@ -59,13 +73,18 @@ class LocalBrowserStateAdapter:
         self._artifacts = artifacts
         self._episodes = root / "episodes"
         self._quarantine = root / "quarantine"
+        self._action_records = root / "actions"
+        self._network_streams = root / "network"
         self._baseline = root / "baseline"
         self._episodes.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._quarantine.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._action_records.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._network_streams.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not self._baseline.exists():
             self._baseline.mkdir(parents=True, mode=0o500)
         self._open: dict[str, _Episode] = {}
         self._captures: dict[str, ActionCapture] = {}
+        self._capture_condition = asyncio.Condition()
 
     async def open_episode(
         self,
@@ -85,9 +104,40 @@ class LocalBrowserStateAdapter:
                 shutil.rmtree(temporary_source, ignore_errors=True)
 
     async def begin_action(self, lease: EpisodeLease, request: ActionRequest) -> ActionCapture:
-        self._require_open(lease)
-        capture = ActionCapture(uuid4().hex, lease.episode_id, request)
+        episode = self._require_open(lease)
+        async with asyncio.timeout(episode.policy.capture_timeout):
+            async with self._capture_condition:
+                await self._capture_condition.wait_for(
+                    lambda: (
+                        sum(item.episode_id == lease.episode_id for item in self._captures.values())
+                        < episode.policy.max_queue_items
+                    )
+                )
+        capture = ActionCapture(
+            uuid4().hex,
+            lease.episode_id,
+            request,
+            started_at=utc_now(),
+            started_monotonic=time.monotonic(),
+        )
         self._captures[capture.capture_id] = capture
+        safe_input = self._redacted_request_input(request)
+        self._publish_action_pointer(
+            capture,
+            {
+                "schema_version": 1,
+                "capture_id": capture.capture_id,
+                "episode_id": capture.episode_id,
+                "task_id": request.task_id,
+                "action_id": request.action_id,
+                "action": request.name,
+                "input": safe_input,
+                "target": str(request.target) if request.target else None,
+                "pre_observation_id": request.pre_observation_id,
+                "started_at": capture.started_at,
+                "complete": False,
+            },
+        )
         return capture
 
     async def finish_action(
@@ -95,18 +145,166 @@ class LocalBrowserStateAdapter:
         capture: ActionCapture,
         result: ActionResult,
         observation: Observation | None,
+        evidence: ActionEvidence | None = None,
     ) -> StateDelta:
-        current = self._captures.pop(capture.capture_id, None)
+        current = self._captures.get(capture.capture_id)
         if current != capture or not self._episode_is_open(capture.episode_id):
             raise LeaseClosedError("action capture is not open")
+        episode = self._episode_for_id(capture.episode_id)
+        browser = evidence.browser if evidence is not None else None
+        all_network_events = (
+            tuple(redact_network_event(event) for event in browser.network_events)
+            if browser
+            else ()
+        )
+        all_storage_events = (
+            tuple(redact_storage_event(event) for event in browser.storage_events)
+            if browser
+            else ()
+        )
+        dropped = max(0, len(all_network_events) - episode.policy.max_queue_items) + max(
+            0, len(all_storage_events) - episode.policy.max_queue_items
+        )
+        network_events = all_network_events[-episode.policy.max_queue_items :]
+        storage_events = all_storage_events[-episode.policy.max_queue_items :]
+        network_span = (
+            (network_events[0].sequence, network_events[-1].sequence) if network_events else None
+        )
+        finished_at = utc_now()
+        duration_ms = max(
+            0.0,
+            (time.monotonic() - capture.started_monotonic) * 1000
+            if capture.started_monotonic is not None
+            else 0.0,
+        )
+        post_digest = observation_digest(observation)
+        pre_url = redact_url(capture.request.pre_url) if capture.request.pre_url else None
+        post_url = redact_url(observation.url) if observation else None
+        warnings = tuple(browser.warnings if browser else ()) + tuple(
+            observation.warnings if observation else ()
+        )
+        if dropped:
+            warnings = (*warnings, "capacity_dropped")
+        errors = (
+            (result.error_code or "action_failed",)
+            if result.status.value in {"failed", "uncertain"}
+            else ()
+        )
+        if browser and browser.required_failure:
+            errors = (*errors, browser.required_failure)
+        omissions = tuple(browser.omissions if browser else ())
+        if dropped:
+            omissions = (*omissions, f"capacity_dropped:{dropped}")
+        (
+            optional_artifacts,
+            optional_warnings,
+            optional_omissions,
+        ) = await self._capture_optional_artifacts(episode, observation, network_events)
+        warnings = (*warnings, *optional_warnings)
+        omissions = (*omissions, *optional_omissions)
+        delta_id = uuid4().hex
+        payload = {
+            "schema_version": 1,
+            "delta_id": delta_id,
+            "capture_id": capture.capture_id,
+            "episode_id": capture.episode_id,
+            "task_id": capture.request.task_id,
+            "action_id": capture.request.action_id,
+            "action": capture.request.name,
+            "read_only": capture.request.read_only,
+            "input": self._redacted_request_input(capture.request),
+            "target": str(capture.request.target) if capture.request.target else None,
+            "result": redact_result(result),
+            "pre_observation_id": capture.request.pre_observation_id,
+            "post_observation_id": observation.observation_id if observation else None,
+            "pre_observation_digest": capture.request.pre_observation_digest,
+            "post_observation_digest": post_digest,
+            "pre_target_id": capture.request.pre_target_id,
+            "post_target_id": observation.active_target_id if observation else None,
+            "pre_url": pre_url,
+            "post_url": post_url,
+            "cookie_changes": browser.cookie_changes if browser else (),
+            "storage_events": storage_events,
+            "network_span": network_span,
+            "artifacts": [artifact_to_dict(item) for item in optional_artifacts],
+            "warnings": warnings,
+            "errors": errors,
+            "human_interventions": evidence.human_interventions if evidence else (),
+            "omissions": omissions,
+            "started_at": capture.started_at,
+            "finished_at": finished_at,
+            "duration_ms": round(duration_ms, 3),
+            "redaction_policy_version": episode.policy.redaction_policy_version,
+            "complete": True,
+        }
+        encoded = canonical_json(payload)
+        if len(encoded) > episode.policy.max_artifact_bytes:
+            await self._finish_capture_slot(capture)
+            self._publish_action_pointer(
+                capture,
+                {**payload, "complete": False, "errors": [*errors, "required_artifact_too_large"]},
+            )
+            raise ValueError("required action artifact exceeds capture byte bound")
+        try:
+            async with asyncio.timeout(episode.policy.capture_timeout):
+                record = await self._artifacts.put(
+                    encoded,
+                    kind=ArtifactKind.ACTION,
+                    media_type="application/json",
+                    schema_version=1,
+                    security_class=SecurityClass.REDACTED,
+                    redaction_policy_version=episode.policy.redaction_policy_version,
+                )
+            self._append_network_events(capture.episode_id, network_events)
+            self._publish_action_pointer(
+                capture, {**payload, "record_content_id": record.content_id}
+            )
+        except BaseException:
+            self._publish_action_pointer(
+                capture,
+                {**payload, "complete": False, "errors": [*errors, "required_capture_failed"]},
+            )
+            raise
+        finally:
+            await self._finish_capture_slot(capture)
+
         return StateDelta(
-            delta_id=uuid4().hex,
+            delta_id=delta_id,
             episode_id=capture.episode_id,
             task_id=capture.request.task_id,
             action_id=capture.request.action_id,
             pre_observation_id=capture.request.pre_observation_id,
             post_observation_id=observation.observation_id if observation else None,
             outcome=result.status,
+            pre_observation_digest=capture.request.pre_observation_digest,
+            post_observation_digest=post_digest,
+            pre_target_id=capture.request.pre_target_id,
+            post_target_id=observation.active_target_id if observation else None,
+            pre_url=pre_url,
+            post_url=post_url,
+            target_changed=(
+                capture.request.pre_target_id is not None
+                and observation is not None
+                and capture.request.pre_target_id != observation.active_target_id
+            ),
+            url_changed=(
+                capture.request.pre_url is not None
+                and observation is not None
+                and capture.request.pre_url != observation.url
+            ),
+            cookie_changes=browser.cookie_changes if browser else (),
+            storage_events=storage_events,
+            network_events=network_events,
+            network_span=network_span,
+            artifacts=(record, *optional_artifacts),
+            warnings=warnings,
+            errors=errors,
+            human_interventions=evidence.human_interventions if evidence else (),
+            omissions=omissions,
+            started_at=capture.started_at,
+            finished_at=finished_at,
+            duration_ms=duration_ms,
+            record=record,
         )
 
     async def confirm_shutdown(self, lease: EpisodeLease, proof: CleanShutdownProof) -> None:
@@ -147,6 +345,117 @@ class LocalBrowserStateAdapter:
         if count < 1:
             raise ValueError("branch count must be greater than zero")
         return [await self.restore(checkpoint) for _ in range(count)]
+
+    async def _finish_capture_slot(self, capture: ActionCapture) -> None:
+        self._captures.pop(capture.capture_id, None)
+        async with self._capture_condition:
+            self._capture_condition.notify_all()
+
+    async def _capture_optional_artifacts(
+        self,
+        episode: _Episode,
+        observation: Observation | None,
+        network_events: tuple[object, ...],
+    ) -> tuple[tuple[ArtifactRef, ...], tuple[str, ...], tuple[str, ...]]:
+        artifacts: list[ArtifactRef] = []
+        warnings: list[str] = []
+        omissions: list[str] = []
+        payloads: list[tuple[ArtifactKind, bytes]] = []
+        for kind in episode.policy.optional_artifacts:
+            if kind is ArtifactKind.OBSERVATION and observation is not None:
+                payloads.append((kind, canonical_json(observation_payload(observation))))
+            elif kind is ArtifactKind.NETWORK:
+                payloads.append((kind, canonical_json(network_events)))
+            elif kind is ArtifactKind.SCREENSHOT:
+                # Pixel redaction needs a field-region mask. Raw pixels are never
+                # persisted when that mask is unavailable.
+                warnings.append("optional_screenshot_redaction_unavailable")
+                omissions.append("screenshot:redaction_unavailable")
+            elif kind is ArtifactKind.DOM:
+                # Action results can contain arbitrary page text. Semantic
+                # observation capture above is safe; raw DOM remains omitted.
+                warnings.append("optional_dom_redaction_unavailable")
+                omissions.append("dom:redaction_unavailable")
+            elif kind not in {ArtifactKind.ACTION, ArtifactKind.CHECKPOINT}:
+                warnings.append(f"optional_{kind.value}_unsupported")
+                omissions.append(f"{kind.value}:unsupported")
+
+        for kind, data in payloads:
+            if len(data) > episode.policy.max_artifact_bytes:
+                warnings.append(f"optional_{kind.value}_too_large")
+                omissions.append(f"{kind.value}:byte_bound")
+                continue
+            try:
+                async with asyncio.timeout(episode.policy.capture_timeout):
+                    artifacts.append(
+                        await self._artifacts.put(
+                            data,
+                            kind=kind,
+                            media_type="application/json",
+                            schema_version=1,
+                            security_class=SecurityClass.REDACTED,
+                            redaction_policy_version=episode.policy.redaction_policy_version,
+                        )
+                    )
+            except Exception as error:
+                warnings.append(f"optional_{kind.value}_failed:{type(error).__name__}")
+                omissions.append(f"{kind.value}:capture_failed")
+        return tuple(artifacts), tuple(warnings), tuple(omissions)
+
+    @staticmethod
+    def _redacted_request_input(request: ActionRequest) -> object:
+        return redact_action_input(
+            BrowserAction(
+                request.name,
+                request.redacted_input,
+                target=request.target,
+                read_only=request.read_only,
+            )
+        )
+
+    def _episode_for_id(self, episode_id: str) -> _Episode:
+        for episode in self._open.values():
+            if episode.lease.episode_id == episode_id:
+                return episode
+        raise LeaseClosedError("episode is not open")
+
+    def _publish_action_pointer(self, capture: ActionCapture, payload: object) -> None:
+        directory = self._action_records / capture.episode_id
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination = directory / f"{capture.capture_id}.json"
+        self._atomic_publish(canonical_json(payload), destination)
+
+    def _append_network_events(self, episode_id: str, events: tuple[object, ...]) -> None:
+        if not events:
+            return
+        destination = self._network_streams / f"{episode_id}.jsonl"
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            with os.fdopen(descriptor, "ab") as stream:
+                for event in events:
+                    stream.write(canonical_json(event) + b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            raise
+
+    @staticmethod
+    def _atomic_publish(data: bytes, destination: Path) -> None:
+        temporary = destination.with_name(f".{uuid4().hex}.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+            directory = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _profile_directory(self, lease: EpisodeLease) -> Path:
         """Internal browser/state boundary: resolve profile for browser launch."""

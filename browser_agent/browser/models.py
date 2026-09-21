@@ -22,6 +22,10 @@ def _empty_int_mapping() -> Mapping[str, int]:
     return {}
 
 
+def _empty_string_mapping() -> Mapping[str, str]:
+    return {}
+
+
 class SessionLifecycle(StrEnum):
     NEW = "new"
     RUNNING = "running"
@@ -231,6 +235,66 @@ class ActionResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkEvent:
+    """Redacted episode-stream event observed during a browser action window."""
+
+    sequence: int
+    kind: str
+    request_id: str
+    monotonic_time: float
+    url: str | None = None
+    method: str | None = None
+    status: int | None = None
+    mime_type: str | None = None
+    encoded_data_length: int | None = None
+    headers: Mapping[str, str] = field(default_factory=_empty_string_mapping)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
+
+
+@dataclass(frozen=True, slots=True)
+class StorageEvent:
+    """Value-free DOM-storage change; secret-bearing values never cross this seam."""
+
+    sequence: int
+    kind: str
+    storage_type: str
+    origin: str | None
+    key: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CookieChange:
+    """Normalized cookie identity change with no persisted cookie value."""
+
+    kind: str
+    name: str
+    domain: str
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceWindow:
+    """Opaque ephemeral cursor and cookie baseline for one serialized action."""
+
+    network_cursor: int
+    storage_cursor: int
+    cookies: tuple[tuple[str, str, str, str], ...] = ()
+    required_errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserEvidence:
+    network_events: tuple[NetworkEvent, ...] = ()
+    storage_events: tuple[StorageEvent, ...] = ()
+    cookie_changes: tuple[CookieChange, ...] = ()
+    warnings: tuple[str, ...] = ()
+    omissions: tuple[str, ...] = ()
+    required_failure: str | None = None
 
 
 class BrowserAdapterError(Exception):

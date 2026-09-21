@@ -14,6 +14,7 @@ from browser_agent.browser import (
     BrowserMetadata,
     BrowserShutdownError,
     NodriverSession,
+    OutcomeStatus,
     SessionLifecycle,
     SessionStateError,
     TimeoutConfig,
@@ -44,6 +45,12 @@ class UnstoppableBrowser(FakeOwnedBrowser):
     async def force_stop(self, timeout: float) -> None:
         del timeout
         raise BrowserShutdownError("Chrome process exit could not be verified")
+
+
+class EvidenceFailBrowser(FakeOwnedBrowser):
+    async def finish_evidence(self, window):  # type: ignore[no-untyped-def]
+        del window
+        raise OSError("injected evidence failure")
 
 
 class NoGracefulCloseBrowser:
@@ -99,6 +106,12 @@ class ProfileStateAdapter(FakeBrowserStateAdapter):
         return await super().abort_episode(lease, error)
 
 
+class FailingCaptureState(ProfileStateAdapter):
+    async def finish_action(self, capture, result, observation, evidence=None):  # type: ignore[no-untyped-def]
+        del capture, result, observation, evidence
+        raise OSError("injected capture failure")
+
+
 def policy() -> CapturePolicy:
     return CapturePolicy("v1", "redaction-v1", restricted_storage=True)
 
@@ -135,9 +148,79 @@ async def test_session_launches_owned_profile_records_metadata_and_closes_once(t
     assert stored_metadata.platform == "test-platform"
     assert runtime.close_requests == 1
     assert runtime.connection_closes == 1
+    assert [request.name for request in state.begun_actions] == ["fixture-action"]
+    assert len(state.finished_actions) == 1
 
     with pytest.raises(SessionStateError, match="cannot start from closed"):
         await session.start()
+
+
+@pytest.mark.asyncio
+async def test_session_redacts_input_before_state_adapter_boundary(tmp_path) -> None:
+    state = ProfileStateAdapter(tmp_path)
+    session = NodriverSession(
+        BrowserConfig(),
+        state,
+        policy(),
+        episode_metadata(),
+        launcher=FakeBrowserLauncher(FakeOwnedBrowser()),
+    )
+    await session.start()
+
+    await session.execute(BrowserAction("type", {"text": "secret-canary"}))
+    await session.close()
+
+    request = state.begun_actions[0]
+    assert "secret-canary" not in repr(request.redacted_input)
+    assert request.redacted_input["text"] == {
+        "placeholder": "[REDACTED]",
+        "character_count": 13,
+        "sensitivity": "type",
+    }
+
+
+@pytest.mark.asyncio
+async def test_required_capture_failure_marks_mutation_uncertain(tmp_path) -> None:
+    state = FailingCaptureState(tmp_path)
+    session = NodriverSession(
+        BrowserConfig(),
+        state,
+        policy(),
+        episode_metadata(),
+        launcher=FakeBrowserLauncher(FakeOwnedBrowser()),
+    )
+    await session.start()
+
+    result = await session.execute(BrowserAction("click"))
+    await session.close()
+
+    assert result.status is OutcomeStatus.UNCERTAIN
+    assert result.error_code == "capture_failed"
+    assert result.details["action_status"] == "succeeded"
+    assert session.observability_failed is True
+
+
+@pytest.mark.asyncio
+async def test_required_browser_evidence_failure_is_recorded_and_marks_mutation_uncertain(
+    tmp_path,
+) -> None:
+    state = ProfileStateAdapter(tmp_path)
+    session = NodriverSession(
+        BrowserConfig(),
+        state,
+        policy(),
+        episode_metadata(),
+        launcher=FakeBrowserLauncher(EvidenceFailBrowser()),
+    )
+    await session.start()
+
+    result = await session.execute(BrowserAction("click"))
+    await session.close()
+
+    assert result.status is OutcomeStatus.UNCERTAIN
+    assert result.error_code == "capture_failed"
+    assert state.finished_actions[0][1].error_code == "capture_failed"
+    assert session.observability_failed is True
 
 
 @pytest.mark.asyncio

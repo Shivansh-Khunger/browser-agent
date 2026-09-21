@@ -7,7 +7,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from .models import ActionResult, BrowserAction, BrowserConfig, BrowserMetadata, Observation
+from .models import (
+    ActionResult,
+    BrowserAction,
+    BrowserConfig,
+    BrowserEvidence,
+    BrowserMetadata,
+    EvidenceWindow,
+    Observation,
+)
 
 
 class RuntimeFailureKind(StrEnum):
@@ -32,6 +40,10 @@ class OwnedBrowser(Protocol):
     async def observe(self) -> Observation: ...
 
     async def execute(self, action: BrowserAction) -> ActionResult: ...
+
+    async def begin_evidence(self) -> EvidenceWindow: ...
+
+    async def finish_evidence(self, window: EvidenceWindow) -> BrowserEvidence: ...
 
     async def wait_for_failure(self) -> RuntimeFailure: ...
 

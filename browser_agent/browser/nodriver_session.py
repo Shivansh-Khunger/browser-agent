@@ -7,9 +7,13 @@ from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 from ..state.adapter import BrowserStateAdapter
+from ..state.capture import observation_digest, redact_action_input
 from ..state.models import (
+    ActionEvidence,
+    ActionRequest,
     CapturePolicy,
     CheckpointRef,
     CleanShutdownProof,
@@ -17,16 +21,19 @@ from ..state.models import (
     EpisodeLease,
     EpisodeMetadata,
     EpisodeOutcome,
+    StateDelta,
 )
 from .models import (
     ActionResult,
     BrowserAction,
     BrowserConfig,
     BrowserDisconnectedError,
+    BrowserEvidence,
     BrowserExitedError,
     BrowserMetadata,
     BrowserShutdownError,
     BrowserTimeoutError,
+    EvidenceWindow,
     Observation,
     OutcomeStatus,
     SessionLifecycle,
@@ -70,6 +77,9 @@ class NodriverSession:
         self._terminal_checkpoint: CheckpointRef | None = None
         self._diagnostic: DiagnosticRef | None = None
         self._fatal_error: BaseException | None = None
+        self._last_observation: Observation | None = None
+        self._last_state_delta: StateDelta | None = None
+        self._observability_failed = False
         self._action_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
 
@@ -100,6 +110,14 @@ class NodriverSession:
     @property
     def fatal_error(self) -> BaseException | None:
         return self._fatal_error
+
+    @property
+    def last_state_delta(self) -> StateDelta | None:
+        return self._last_state_delta
+
+    @property
+    def observability_failed(self) -> bool:
+        return self._observability_failed
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -141,7 +159,9 @@ class NodriverSession:
             self._require_running()
             try:
                 async with asyncio.timeout(self._config.timeouts.action):
-                    return await runtime.observe()
+                    observation = await runtime.observe()
+                    self._last_observation = observation
+                    return observation
             except TimeoutError as error:
                 raise BrowserTimeoutError("browser observation timed out") from error
 
@@ -149,20 +169,130 @@ class NodriverSession:
         runtime = self._require_running()
         async with self._action_lock:
             self._require_running()
+            lease = self._lease
+            if lease is None:
+                raise SessionStateError("session has no episode lease")
+            previous = self._last_observation
+            capture = await self._state.begin_action(
+                lease,
+                ActionRequest(
+                    task_id=self._episode_metadata.task_id or "session",
+                    action_id=uuid4().hex,
+                    name=action.name,
+                    redacted_input=redact_action_input(action),
+                    target=action.target,
+                    pre_observation_id=previous.observation_id if previous else None,
+                    pre_observation_digest=observation_digest(previous),
+                    pre_target_id=previous.active_target_id if previous else self.active_target_id,
+                    pre_url=previous.url if previous else None,
+                    read_only=action.read_only,
+                ),
+            )
+            evidence_window = await self._begin_evidence(runtime)
             try:
                 async with asyncio.timeout(self._config.timeouts.action):
-                    return await runtime.execute(action)
+                    result = await runtime.execute(action)
             except TimeoutError:
                 # Mutation might already have reached Chromium when CDP or page
                 # settlement runs out. Return an explicit non-retryable outcome
                 # instead of inviting the harness to replay a click or form fill.
                 status = OutcomeStatus.FAILED if action.read_only else OutcomeStatus.UNCERTAIN
-                return ActionResult(
+                result = ActionResult(
                     status,
                     f"browser action {action.name} timed out",
                     error_code="timeout",
                     retryable=False,
                 )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                failed = ActionResult(
+                    OutcomeStatus.FAILED,
+                    f"browser action {action.name} raised {type(error).__name__}",
+                    error_code=getattr(error, "code", "action_exception"),
+                    retryable=bool(getattr(error, "retryable", False)),
+                )
+                evidence = await self._finish_evidence(runtime, evidence_window)
+                with suppress(Exception):
+                    self._last_state_delta = await self._state.finish_action(
+                        capture, failed, previous, ActionEvidence(evidence)
+                    )
+                raise
+
+            observation = previous if action.read_only else result.observation
+            if result.observation is not None:
+                self._last_observation = result.observation
+                observation = result.observation
+            evidence = await self._finish_evidence(runtime, evidence_window)
+            if evidence.required_failure is not None:
+                self._observability_failed = True
+                result = self._capture_failure_result(action, result, evidence.required_failure)
+            try:
+                self._last_state_delta = await self._state.finish_action(
+                    capture, result, observation, ActionEvidence(evidence)
+                )
+            except Exception as error:
+                self._observability_failed = True
+                return self._capture_failure_result(action, result, type(error).__name__)
+            return result
+
+    @staticmethod
+    def _capture_failure_result(
+        action: BrowserAction, result: ActionResult, error: str
+    ) -> ActionResult:
+        original_status = result.details.get("action_status", result.status.value)
+        status = (
+            OutcomeStatus.UNCERTAIN
+            if not action.read_only and original_status != OutcomeStatus.FAILED.value
+            else OutcomeStatus.PARTIAL
+        )
+        return replace(
+            result,
+            status=status,
+            message=(
+                result.message
+                if result.error_code == "capture_failed"
+                else f"{result.message}; required capture failed"
+            ),
+            error_code="capture_failed",
+            retryable=False,
+            details={
+                **result.details,
+                "capture_error": error,
+                "action_status": original_status,
+            },
+        )
+
+    @staticmethod
+    async def _begin_evidence(runtime: OwnedBrowser) -> EvidenceWindow:
+        method = getattr(runtime, "begin_evidence", None)
+        if method is None:
+            return EvidenceWindow(0, 0)
+        try:
+            return await method()
+        except Exception as error:
+            return EvidenceWindow(
+                0,
+                0,
+                required_errors=(f"browser_evidence_begin:{type(error).__name__}",),
+            )
+
+    @staticmethod
+    async def _finish_evidence(runtime: OwnedBrowser, window: EvidenceWindow) -> BrowserEvidence:
+        method = getattr(runtime, "finish_evidence", None)
+        if method is None:
+            return BrowserEvidence(omissions=("browser_evidence_unavailable",))
+        try:
+            evidence = await method(window)
+            if window.required_errors and evidence.required_failure is None:
+                return replace(evidence, required_failure=window.required_errors[0])
+            return evidence
+        except Exception as error:
+            return BrowserEvidence(
+                warnings=(f"browser_evidence_failed:{type(error).__name__}",),
+                omissions=("required_browser_evidence",),
+                required_failure=f"browser_evidence_finish:{type(error).__name__}",
+            )
 
     async def close(self) -> None:
         async with self._lifecycle_lock:
@@ -303,7 +433,10 @@ class NodriverSession:
                 self._diagnostic = await self._state.abort_episode(lease, error)
 
     async def _force_stop(self, runtime: OwnedBrowser) -> None:
-        await runtime.force_stop(min(1.0, self._config.timeouts.shutdown))
+        # Graceful shutdown obeys configured deadline. Forced process reaping gets
+        # its own fixed safety budget so tiny test/operator deadlines cannot leave
+        # Chrome alive with profile locks held.
+        await runtime.force_stop(1.0)
 
     async def _cancel_monitor(self) -> None:
         monitor = self._monitor

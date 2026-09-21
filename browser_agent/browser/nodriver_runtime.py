@@ -14,6 +14,7 @@ from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import nodriver
 from nodriver import cdp
@@ -26,15 +27,20 @@ from .models import (
     BrowserAction,
     BrowserConfig,
     BrowserEvaluationError,
+    BrowserEvidence,
     BrowserLaunchError,
     BrowserMetadata,
     BrowserShutdownError,
     ClosedTargetError,
+    CookieChange,
+    EvidenceWindow,
+    NetworkEvent,
     Observation,
     OutcomeStatus,
     ScreenshotMetadata,
     SemanticControl,
     StaleTargetError,
+    StorageEvent,
     TargetHandle,
 )
 from .nodriver_actions import (
@@ -84,7 +90,9 @@ class NodriverLauncher:
             async with asyncio.timeout(config.timeouts.launch):
                 await browser.start()
                 await _apply_context_overrides(browser, config)
-            return NodriverOwnedBrowser(browser, config)
+            runtime = NodriverOwnedBrowser(browser, config)
+            await runtime.start_capture()
+            return runtime
         except BaseException as error:
             if browser is not None:
                 try:
@@ -118,6 +126,7 @@ class NodriverOwnedBrowser:
         self._adoption_order: list[str] = []
         self._observation_count = 0
         self._current_observation_id: str | None = None
+        self._current_observation: Observation | None = None
         self._current_screenshot: ScreenshotMetadata | None = None
         self._current_frame_generations: dict[str, int] = {}
         self._control_index: dict[str, ControlTarget] = {}
@@ -125,6 +134,14 @@ class NodriverOwnedBrowser:
         self._redacted_backend_node_ids: set[object] = set()
         self._redaction_tokens: set[str] = set()
         self._frames = FrameRegistry(self._active_tab)
+        self._evidence_sequence = 0
+        self._network_events: list[NetworkEvent] = []
+        self._storage_events: list[StorageEvent] = []
+        self._instrumented_targets: set[str] = set()
+        self._capture_drops = 0
+
+    async def start_capture(self) -> None:
+        await self._instrument_tab(self._active_tab)
 
     @property
     def process_id(self) -> int:
@@ -194,6 +211,7 @@ class NodriverOwnedBrowser:
             ),
         )
         self._current_observation_id = observation_id
+        self._current_observation = observation
         self._current_screenshot = observation.screenshot
         self._current_frame_generations = dict(observation.frame_generations)
         self._control_index = capture.control_index
@@ -236,8 +254,148 @@ class NodriverOwnedBrowser:
         else:
             raise BrowserEvaluationError(f"unsupported browser action: {action.name!r}")
         ambiguity = await self._reconcile_action_targets(before, source_target_id, result)
-        observation = await self.observe()
+        if action.read_only and self._current_observation is not None and ambiguity is None:
+            observation = self._current_observation
+        else:
+            observation = await self.observe()
         return replace(ambiguity or result, observation=observation)
+
+    async def begin_evidence(self) -> EvidenceWindow:
+        await self._instrument_tab(self._active_tab)
+        return EvidenceWindow(
+            self._evidence_sequence,
+            self._evidence_sequence,
+            await self._cookie_snapshot(),
+        )
+
+    async def finish_evidence(self, window: EvidenceWindow) -> BrowserEvidence:
+        cookies = await self._cookie_snapshot()
+        warning = ("capacity_dropped",) if self._capture_drops else ()
+        omissions = ("network_or_storage_events",) if self._capture_drops else ()
+        self._capture_drops = 0
+        return BrowserEvidence(
+            network_events=tuple(
+                event for event in self._network_events if event.sequence > window.network_cursor
+            ),
+            storage_events=tuple(
+                event for event in self._storage_events if event.sequence > window.storage_cursor
+            ),
+            cookie_changes=_cookie_changes(window.cookies, cookies),
+            warnings=warning,
+            omissions=omissions,
+        )
+
+    async def _cookie_snapshot(self) -> tuple[tuple[str, str, str, str], ...]:
+        cookies = await self._active_tab.send(cdp.network.get_cookies())
+        return tuple(
+            sorted((cookie.name, cookie.domain, cookie.path, cookie.value) for cookie in cookies)
+        )
+
+    async def _instrument_tab(self, tab: Tab) -> None:
+        target_id = _tab_target_id(tab)
+        if target_id in self._instrumented_targets:
+            return
+        await tab.send(cdp.network.enable(max_post_data_size=0))
+        await tab.send(cdp.dom_storage.enable())
+
+        def request(event: cdp.network.RequestWillBeSent) -> None:
+            headers = {
+                str(name).lower(): str(value)
+                for name, value in event.request.headers.items()
+                if not _secret_header(str(name))
+            }
+            self._record_network(
+                "request",
+                str(event.request_id),
+                float(event.timestamp),
+                url=_redact_network_url(event.request.url),
+                method=event.request.method,
+                headers=headers,
+            )
+
+        def response(event: cdp.network.ResponseReceived) -> None:
+            headers = {
+                str(name).lower(): str(value)
+                for name, value in event.response.headers.items()
+                if not _secret_header(str(name))
+            }
+            self._record_network(
+                "response",
+                str(event.request_id),
+                float(event.timestamp),
+                url=_redact_network_url(event.response.url),
+                status=event.response.status,
+                mime_type=event.response.mime_type,
+                headers=headers,
+            )
+
+        def finished(event: cdp.network.LoadingFinished) -> None:
+            self._record_network(
+                "finished",
+                str(event.request_id),
+                float(event.timestamp),
+                encoded_data_length=max(0, round(event.encoded_data_length)),
+            )
+
+        def storage_added(event: cdp.dom_storage.DomStorageItemAdded) -> None:
+            self._record_storage("added", event.storage_id, event.key)
+
+        def storage_updated(event: cdp.dom_storage.DomStorageItemUpdated) -> None:
+            self._record_storage("updated", event.storage_id, event.key)
+
+        def storage_removed(event: cdp.dom_storage.DomStorageItemRemoved) -> None:
+            self._record_storage("removed", event.storage_id, event.key)
+
+        def storage_cleared(event: cdp.dom_storage.DomStorageItemsCleared) -> None:
+            self._record_storage("cleared", event.storage_id, None)
+
+        tab.add_handler(cdp.network.RequestWillBeSent, request)
+        tab.add_handler(cdp.network.ResponseReceived, response)
+        tab.add_handler(cdp.network.LoadingFinished, finished)
+        tab.add_handler(cdp.dom_storage.DomStorageItemAdded, storage_added)
+        tab.add_handler(cdp.dom_storage.DomStorageItemUpdated, storage_updated)
+        tab.add_handler(cdp.dom_storage.DomStorageItemRemoved, storage_removed)
+        tab.add_handler(cdp.dom_storage.DomStorageItemsCleared, storage_cleared)
+        self._instrumented_targets.add(target_id)
+
+    def _record_network(
+        self,
+        kind: str,
+        request_id: str,
+        monotonic_time: float,
+        **values: object,
+    ) -> None:
+        self._evidence_sequence += 1
+        self._network_events.append(
+            NetworkEvent(
+                sequence=self._evidence_sequence,
+                kind=kind,
+                request_id=request_id,
+                monotonic_time=monotonic_time,
+                **values,  # type: ignore[arg-type]
+            )
+        )
+        self._bound_evidence(self._network_events)
+
+    def _record_storage(
+        self, kind: str, storage_id: cdp.dom_storage.StorageId, key: str | None
+    ) -> None:
+        self._evidence_sequence += 1
+        self._storage_events.append(
+            StorageEvent(
+                sequence=self._evidence_sequence,
+                kind=kind,
+                storage_type="local" if storage_id.is_local_storage else "session",
+                origin=storage_id.security_origin,
+                key=key,
+            )
+        )
+        self._bound_evidence(self._storage_events)
+
+    def _bound_evidence(self, events: list[NetworkEvent] | list[StorageEvent]) -> None:
+        if len(events) > 4096:
+            del events[: len(events) - 4096]
+            self._capture_drops += 1
 
     async def _execute_navigate(self, action: BrowserAction) -> ActionResult:
         url = action.arguments.get("url")
@@ -542,6 +700,7 @@ class NodriverOwnedBrowser:
         tabs = {_tab_target_id(cast(Tab, tab)): cast(Tab, tab) for tab in self._browser.tabs}
         for target_id, tab in tabs.items():
             self._target_openers[target_id] = _tab_opener_id(tab)
+            await self._instrument_tab(tab)
         return tabs
 
     async def _repair_active_tab(self) -> dict[str, Tab]:
@@ -611,6 +770,7 @@ class NodriverOwnedBrowser:
         self._active_target_id = target_id
         self._frames = FrameRegistry(tab)
         self._current_observation_id = None
+        self._current_observation = None
         self._current_screenshot = None
         self._current_frame_generations = {}
         self._control_index = {}
@@ -686,6 +846,57 @@ def _target_details(tab: Tab) -> dict[str, object]:
         "title": str(getattr(target, "title", "")),
         "opener_id": _tab_opener_id(tab),
     }
+
+
+def _cookie_changes(
+    before: tuple[tuple[str, str, str, str], ...],
+    after: tuple[tuple[str, str, str, str], ...],
+) -> tuple[CookieChange, ...]:
+    old = {(name, domain, path): value for name, domain, path, value in before}
+    new = {(name, domain, path): value for name, domain, path, value in after}
+    changes: list[CookieChange] = []
+    for identity in sorted(old.keys() | new.keys()):
+        if identity not in old:
+            kind = "added"
+        elif identity not in new:
+            kind = "removed"
+        elif old[identity] != new[identity]:
+            kind = "updated"
+        else:
+            continue
+        changes.append(CookieChange(kind, *identity))
+    return tuple(changes)
+
+
+def _redact_network_url(value: str) -> str:
+    try:
+        split = urlsplit(value)
+        query = [
+            (
+                key,
+                "[REDACTED]"
+                if any(
+                    token in key.casefold()
+                    for token in ("auth", "code", "key", "password", "secret", "sig", "token")
+                )
+                else item,
+            )
+            for key, item in parse_qsl(split.query, keep_blank_values=True)
+        ]
+        host = split.hostname or ""
+        if split.port is not None:
+            host = f"{host}:{split.port}"
+        return urlunsplit((split.scheme, host, split.path, urlencode(query), ""))
+    except ValueError:
+        return "[REDACTED_URL]"
+
+
+def _secret_header(name: str) -> bool:
+    normalized = name.casefold().replace("_", "-")
+    return any(
+        token in normalized
+        for token in ("authorization", "cookie", "credential", "key", "secret", "token")
+    )
 
 
 def _finite_coordinate(value: object, name: str) -> float:

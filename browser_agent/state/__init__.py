@@ -5,6 +5,7 @@ from .artifacts import ArtifactStore, LocalArtifactStore
 from .local import LocalBrowserStateAdapter
 from .models import (
     ActionCapture,
+    ActionEvidence,
     ActionRequest,
     ArtifactIntegrityError,
     ArtifactKind,
@@ -27,6 +28,7 @@ from .models import (
 
 __all__ = [
     "ActionCapture",
+    "ActionEvidence",
     "ActionRequest",
     "ArtifactKind",
     "ArtifactIntegrityError",

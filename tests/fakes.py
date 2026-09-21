@@ -9,7 +9,9 @@ from browser_agent.browser.models import (
     ActionResult,
     BrowserAction,
     BrowserConfig,
+    BrowserEvidence,
     BrowserMetadata,
+    EvidenceWindow,
     Observation,
     OutcomeStatus,
     SessionLifecycle,
@@ -21,6 +23,7 @@ from browser_agent.browser.runtime import RuntimeFailure, RuntimeFailureKind
 from browser_agent.browser.transport import BrowserTransport
 from browser_agent.state.models import (
     ActionCapture,
+    ActionEvidence,
     ActionRequest,
     ArtifactKind,
     ArtifactNotFoundError,
@@ -123,6 +126,13 @@ class FakeOwnedBrowser:
 
     async def execute(self, action: BrowserAction) -> ActionResult:
         return ActionResult(OutcomeStatus.SUCCEEDED, f"{action.name} completed")
+
+    async def begin_evidence(self) -> EvidenceWindow:
+        return EvidenceWindow(0, 0)
+
+    async def finish_evidence(self, window: EvidenceWindow) -> BrowserEvidence:
+        del window
+        return BrowserEvidence()
 
     async def wait_for_failure(self) -> RuntimeFailure:
         return await self._failure
@@ -309,6 +319,8 @@ class FakeBrowserStateAdapter:
         self.policy_by_episode: dict[str, CapturePolicy] = {}
         self.metadata_by_episode: dict[str, EpisodeMetadata] = {}
         self._stopped: set[str] = set()
+        self.begun_actions: list[ActionRequest] = []
+        self.finished_actions: list[tuple[ActionCapture, ActionResult, ActionEvidence | None]] = []
 
     def _lease(self, parent_checkpoint_id: str | None = None) -> EpisodeLease:
         number = self._next_episode
@@ -338,6 +350,7 @@ class FakeBrowserStateAdapter:
 
     async def begin_action(self, lease: EpisodeLease, request: ActionRequest) -> ActionCapture:
         self._require_open(lease)
+        self.begun_actions.append(request)
         number = self._next_capture
         self._next_capture += 1
         return ActionCapture(f"capture-{number}", lease.episode_id, request)
@@ -347,8 +360,10 @@ class FakeBrowserStateAdapter:
         capture: ActionCapture,
         result: ActionResult,
         observation: Observation | None,
+        evidence: ActionEvidence | None = None,
     ) -> StateDelta:
         self._require_episode_open(capture.episode_id)
+        self.finished_actions.append((capture, result, evidence))
         number = self._next_delta
         self._next_delta += 1
         return StateDelta(

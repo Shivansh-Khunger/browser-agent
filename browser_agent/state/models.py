@@ -7,7 +7,14 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 
-from ..browser.models import OutcomeStatus, TargetHandle
+from ..browser.models import (
+    BrowserEvidence,
+    CookieChange,
+    NetworkEvent,
+    OutcomeStatus,
+    StorageEvent,
+    TargetHandle,
+)
 
 
 def _empty_object_mapping() -> Mapping[str, object]:
@@ -159,6 +166,10 @@ class ActionRequest:
     redacted_input: Mapping[str, object] = field(default_factory=_empty_object_mapping)
     target: TargetHandle | None = None
     pre_observation_id: str | None = None
+    pre_observation_digest: str | None = None
+    pre_target_id: str | None = None
+    pre_url: str | None = None
+    read_only: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "redacted_input", MappingProxyType(dict(self.redacted_input)))
@@ -169,6 +180,8 @@ class ActionCapture:
     capture_id: str
     episode_id: str
     request: ActionRequest
+    started_at: str | None = None
+    started_monotonic: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +193,33 @@ class StateDelta:
     pre_observation_id: str | None
     post_observation_id: str | None
     outcome: OutcomeStatus
+    pre_observation_digest: str | None = None
+    post_observation_digest: str | None = None
+    pre_target_id: str | None = None
+    post_target_id: str | None = None
+    pre_url: str | None = None
+    post_url: str | None = None
+    target_changed: bool = False
+    url_changed: bool = False
+    cookie_changes: tuple[CookieChange, ...] = ()
+    storage_events: tuple[StorageEvent, ...] = ()
+    network_events: tuple[NetworkEvent, ...] = ()
+    network_span: tuple[int, int] | None = None
     artifacts: tuple[ArtifactRef, ...] = ()
     warnings: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+    human_interventions: tuple[str, ...] = ()
+    omissions: tuple[str, ...] = ()
+    started_at: str | None = None
+    finished_at: str | None = None
+    duration_ms: float | None = None
+    complete: bool = True
+    record: ArtifactRef | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ActionEvidence:
+    """Ephemeral evidence supplied to adapter; adapter persists only redacted forms."""
+
+    browser: BrowserEvidence = field(default_factory=BrowserEvidence)
     human_interventions: tuple[str, ...] = ()
