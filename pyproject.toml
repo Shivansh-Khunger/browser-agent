@@ -1,11 +1,10 @@
 [project]
 name = "browser-agent"
 version = "0.1.0"
-description = "A general-purpose browser agent built on Camoufox (Firefox), driven by any model via OpenRouter."
+description = "An asynchronous Chromium browser agent driven by any model via OpenRouter."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "camoufox[geoip]",
     "cryptography>=46.0.0",
     "nodriver==0.50.3",
     "openai>=3.16.2",

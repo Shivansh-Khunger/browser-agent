@@ -62,24 +62,6 @@ class TaskResult:
     human_interventions: tuple[str, ...] = ()
 
 
-_DISMISS_HINTS = (
-    "cookie",
-    "consent",
-    "gdpr",
-    "we use cookies",
-    "accept all",
-    "accept cookies",
-    "manage preferences",
-    "privacy policy",
-    "newsletter",
-    "subscribe",
-    "sign up for",
-    "% off your first",
-    "no thanks",
-    "maybe later",
-    "allow all",
-)
-_FILLABLE_ROLES = ("textbox", "searchbox", "combobox")
 _VERIFICATION_HINT = re.compile(
     r"captcha|human verification|verify you are human|unusual traffic|cloudflare|turnstile",
     re.IGNORECASE,
@@ -101,45 +83,8 @@ def _control_text(control: SemanticControl) -> str:
     return " ".join(bit for bit in bits if bit)
 
 
-def _legacy_render_state(state: Mapping[str, Any]) -> str:
-    """Keep pure-helper compatibility until old-backend deletion in issue #21."""
-    elements = list(state["elements"])
-    overlays = [item for item in elements if item.get("overlay")]
-    out = f"URL: {state['url']}\nTitle: {state['title']}\n\n"
-    if overlays:
-        if any(item.get("role") in _FILLABLE_ROLES for item in overlays):
-            banner = prompts.FORM_BANNER
-        else:
-            text = " ".join(item.get("text", "") for item in overlays).lower()
-            banner = (
-                prompts.DISMISS_BANNER
-                if any(hint in text for hint in _DISMISS_HINTS)
-                else prompts.ENGAGE_BANNER
-            )
-        out += banner
-        out += "\n".join(f"[{item['index']}] {item['text']}" for item in overlays) + "\n\n"
-    lines: list[str] = []
-    for node in state["nodes"]:
-        if node.get("overlay"):
-            continue
-        if node["kind"] == "heading":
-            lines.append(f"# {node.get('name', '')}")
-        elif node["kind"] == "text":
-            lines.append(f"- {node.get('name', '')}")
-        else:
-            lines.append(f"[{node['index']}] {node['text']}")
-    has_control = any(
-        node["kind"] == "control" and not node.get("overlay") for node in state["nodes"]
-    )
-    return (
-        out + "Page outline:\n" + ("\n".join(lines) if has_control else "(no interactive elements)")
-    )
-
-
-def render_state(state: Observation | Mapping[str, Any]) -> str:
+def render_state(state: Observation) -> str:
     """Render one observation into bounded model-facing text."""
-    if not isinstance(state, Observation):
-        return _legacy_render_state(state)
     lines = [f"URL: {state.url}", f"Title: {state.title}", "", "Page outline:"]
     for node in state.context:
         marker = "#" if node.kind == "heading" else "-"
@@ -186,10 +131,7 @@ def repeat_guard_step(
     return stuck, (stuck_repeats + 1 if stuck else 0)
 
 
-def page_signature(state: Observation | Mapping[str, Any]) -> str:
-    if not isinstance(state, Observation):
-        elements = list(state["elements"])
-        return f"{state['url']}#{len(elements)}#" + "|".join(item["text"] for item in elements[:6])
+def page_signature(state: Observation) -> str:
     controls = "|".join(_control_text(control) for control in state.controls[:6])
     context = "|".join(node.text for node in state.context[:4])
     return f"{state.url}#{state.document_generation}#{len(state.controls)}#{controls}#{context}"

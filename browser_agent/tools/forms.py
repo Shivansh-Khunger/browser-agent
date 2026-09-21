@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..browser.session import BrowserSession
+from ..browser import BrowserSession
 from .registry import tool
 
 

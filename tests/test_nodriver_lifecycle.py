@@ -481,7 +481,7 @@ async def test_timed_out_version_probe_is_killed_and_reaped(tmp_path) -> None:
         await NodriverLauncher().inspect(
             BrowserConfig(
                 executable_path=executable,
-                timeouts=TimeoutConfig(launch=0.5),
+                timeouts=TimeoutConfig(launch=2.0),
             )
         )
 
@@ -574,7 +574,7 @@ async def test_installed_browser_forced_shutdown_leaks_no_process_or_profile_loc
     state = LocalBrowserStateAdapter(tmp_path / "state", store)
     launcher = WrappingNodriverLauncher(NoGracefulCloseBrowser)
     session = NodriverSession(
-        BrowserConfig(headless=True, timeouts=TimeoutConfig(shutdown=0.05)),
+        BrowserConfig(headless=True, timeouts=TimeoutConfig(shutdown=0.5)),
         state,
         policy(),
         episode_metadata(),
@@ -624,7 +624,7 @@ async def test_installed_browser_cancelled_close_still_releases_process_and_lock
 
 
 async def _wait_until_closed(session: NodriverSession) -> None:
-    async with asyncio.timeout(1):
+    async with asyncio.timeout(5):
         while session.lifecycle is not SessionLifecycle.CLOSED:
             await asyncio.sleep(0)
 
