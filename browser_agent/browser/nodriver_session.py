@@ -28,6 +28,7 @@ from .models import (
     BrowserShutdownError,
     BrowserTimeoutError,
     Observation,
+    OutcomeStatus,
     SessionLifecycle,
     SessionStateError,
 )
@@ -151,8 +152,17 @@ class NodriverSession:
             try:
                 async with asyncio.timeout(self._config.timeouts.action):
                     return await runtime.execute(action)
-            except TimeoutError as error:
-                raise BrowserTimeoutError(f"browser action {action.name} timed out") from error
+            except TimeoutError:
+                # Mutation might already have reached Chromium when CDP or page
+                # settlement runs out. Return an explicit non-retryable outcome
+                # instead of inviting the harness to replay a click or form fill.
+                status = OutcomeStatus.FAILED if action.read_only else OutcomeStatus.UNCERTAIN
+                return ActionResult(
+                    status,
+                    f"browser action {action.name} timed out",
+                    error_code="timeout",
+                    retryable=False,
+                )
 
     async def close(self) -> None:
         async with self._lifecycle_lock:

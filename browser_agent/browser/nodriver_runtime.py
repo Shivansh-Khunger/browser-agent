@@ -30,10 +30,20 @@ from .models import (
     BrowserShutdownError,
     ClosedTargetError,
     Observation,
+    OutcomeStatus,
     ScreenshotMetadata,
+    SemanticControl,
     StaleTargetError,
+    TargetHandle,
 )
-from .nodriver_actions import click, click_at, navigate
+from .nodriver_actions import (
+    click,
+    click_at,
+    navigate,
+    select_option,
+    type_otp,
+    type_text,
+)
 from .nodriver_dom import ControlTarget, capture_observation, read_viewport
 from .nodriver_frames import FrameRegistry, find_frame, frame_generations
 from .runtime import OwnedBrowser, RuntimeFailure, RuntimeFailureKind
@@ -100,6 +110,9 @@ class NodriverOwnedBrowser:
         self._current_screenshot: ScreenshotMetadata | None = None
         self._current_frame_generations: dict[str, int] = {}
         self._control_index: dict[str, ControlTarget] = {}
+        self._control_semantics: dict[str, SemanticControl] = {}
+        self._redacted_backend_node_ids: set[object] = set()
+        self._redaction_tokens: set[str] = set()
         self._frames = FrameRegistry(browser.main_tab)
 
     @property
@@ -122,11 +135,61 @@ class NodriverOwnedBrowser:
             frame_root=frame_root,
             limits=self._config.observation_limits,
         )
+        sensitive_bounds = tuple(
+            (control.frame_breadcrumb, control.bounds)
+            for control in capture.observation.controls
+            if (
+                capture.control_index[control.handle.control_id].backend_node_id
+                in self._redacted_backend_node_ids
+            )
+            and control.bounds is not None
+        )
+
+        def redact(control: SemanticControl) -> SemanticControl:
+            backend_node_id = capture.control_index[control.handle.control_id].backend_node_id
+            if backend_node_id in self._redacted_backend_node_ids:
+                return replace(control, potentially_sensitive=True, value=None)
+            if any(
+                control.frame_breadcrumb == breadcrumb and _bounds_contain(bounds, control.bounds)
+                for breadcrumb, bounds in sensitive_bounds
+            ):
+                # Chromium can surface live input text as a separate AX text
+                # descendant. It has a different backend ID, so redact it by
+                # its containing field's current bounds as well.
+                return replace(
+                    control,
+                    potentially_sensitive=True,
+                    name="",
+                    description="",
+                    value=None,
+                )
+            return control
+
+        controls = tuple(redact(control) for control in capture.observation.controls)
+        observation = replace(
+            capture.observation,
+            controls=tuple(
+                replace(
+                    control,
+                    name=self._redact_text(control.name),
+                    description=self._redact_text(control.description),
+                    value=self._redact_text(control.value) if control.value is not None else None,
+                )
+                for control in controls
+            ),
+            context=tuple(
+                replace(node, text=self._redact_text(node.text))
+                for node in capture.observation.context
+            ),
+        )
         self._current_observation_id = observation_id
-        self._current_screenshot = capture.observation.screenshot
-        self._current_frame_generations = dict(capture.observation.frame_generations)
+        self._current_screenshot = observation.screenshot
+        self._current_frame_generations = dict(observation.frame_generations)
         self._control_index = capture.control_index
-        return capture.observation
+        self._control_semantics = {
+            control.handle.control_id: control for control in observation.controls
+        }
+        return observation
 
     async def execute(self, action: BrowserAction) -> ActionResult:
         self._require_active_tab()
@@ -136,6 +199,28 @@ class NodriverOwnedBrowser:
             result = await self._execute_click(action)
         elif action.name == "click_at":
             result = await self._execute_click_at(action)
+        elif action.name == "type":
+            result = await self._execute_type(action)
+        elif action.name == "fill_form":
+            result = await self._execute_fill_form(action)
+        elif action.name == "type_otp":
+            result = await self._execute_type_otp(action)
+        elif action.name == "select_option":
+            result = await self._execute_select_option(action)
+        elif action.name == "scroll":
+            result = await self._execute_scroll(action)
+        elif action.name == "back":
+            result = await self._execute_back()
+        elif action.name == "read_page":
+            result = await self._execute_read_page()
+        elif action.name == "get_html":
+            result = await self._execute_get_html()
+        elif action.name == "screenshot":
+            result = await self._execute_screenshot()
+        elif action.name == "viewport":
+            result = await self._execute_viewport()
+        elif action.name == "evaluate":
+            result = await self._execute_evaluate(action)
         else:
             raise BrowserEvaluationError(f"unsupported browser action: {action.name!r}")
         self._require_active_tab()
@@ -150,16 +235,26 @@ class NodriverOwnedBrowser:
         return result
 
     async def _execute_click(self, action: BrowserAction) -> ActionResult:
-        target = action.target
-        if target is None:
-            raise ValueError("click requires a target handle")
+        control_target, _control = await self._resolve_control(action.target, "click")
+        return await click(
+            control_target.session,
+            control_target.backend_node_id,
+            self._config.timeouts,
+        )
+
+    async def _resolve_control(
+        self, target: object, action_name: str
+    ) -> tuple[ControlTarget, SemanticControl]:
+        if not isinstance(target, TargetHandle):
+            raise ValueError(f"{action_name} requires a target handle")
         if target.observation_id != self._current_observation_id:
             raise StaleTargetError(
                 f"target belongs to observation {target.observation_id}; "
                 f"current observation is {self._current_observation_id}"
             )
         control_target = self._control_index.get(target.control_id)
-        if control_target is None:
+        control = self._control_semantics.get(target.control_id)
+        if control_target is None or control is None:
             raise StaleTargetError(
                 f"unknown control {target.control_id} for observation {target.observation_id}"
             )
@@ -179,11 +274,231 @@ class NodriverOwnedBrowser:
                 f"control {target.control_id} belongs to a stale frame document; "
                 "take a fresh observation"
             )
-        return await click(
+        return control_target, control
+
+    async def _execute_type(self, action: BrowserAction) -> ActionResult:
+        text = action.arguments.get("text")
+        if not isinstance(text, str):
+            return _failed_action("invalid_arguments", "type requires a string 'text' argument")
+        submit = action.arguments.get("submit", False)
+        if not isinstance(submit, bool):
+            return _failed_action("invalid_arguments", "type 'submit' must be a boolean")
+        return await self._type_target(action.target, text, submit)
+
+    async def _type_target(self, target: object, text: str, submit: bool) -> ActionResult:
+        try:
+            control_target, control = await self._resolve_control(target, "type")
+        except (StaleTargetError, ValueError) as error:
+            return _failed_action(_target_error_code(error), "text target is stale or unavailable")
+        if "disabled" in control.states:
+            return _failed_action("disabled", "text control is disabled")
+        if "readonly" in control.states:
+            return _failed_action("readonly", "text control is readonly")
+        if not control.visible:
+            return _failed_action("target_obscured", "text control is not visible")
+        result = await type_text(
             control_target.session,
             control_target.backend_node_id,
-            self._config.timeouts,
+            text,
+            submit=submit,
+            timeouts=self._config.timeouts,
         )
+        if result.status in {OutcomeStatus.SUCCEEDED, OutcomeStatus.UNCERTAIN}:
+            # Text supplied to browser actions commonly contains credentials,
+            # addresses, codes, or other secrets. Once a control receives text,
+            # future observations never record its value for this episode.
+            self._redacted_backend_node_ids.add(control_target.backend_node_id)
+            if text:
+                self._redaction_tokens.add(text)
+        return result
+
+    async def _execute_fill_form(self, action: BrowserAction) -> ActionResult:
+        fields = action.arguments.get("fields")
+        if not isinstance(fields, (list, tuple)):
+            return _failed_action("invalid_arguments", "fill_form requires a 'fields' list")
+        completed: list[str] = []
+        for field in fields:
+            if not isinstance(field, dict):
+                return _form_stop(completed, "invalid_arguments", "form field is invalid")
+            text = field.get("text")
+            submit = field.get("submit", False)
+            target = field.get("target")
+            if not isinstance(text, str) or not isinstance(submit, bool):
+                return _form_stop(
+                    completed, "invalid_arguments", "form field arguments are invalid"
+                )
+            result = await self._type_target(target, text, submit)
+            if result.status is not OutcomeStatus.SUCCEEDED:
+                return _form_stop(completed, result.error_code or "field_failed", result.message)
+            if isinstance(target, TargetHandle):
+                completed.append(target.control_id)
+        return ActionResult(
+            OutcomeStatus.SUCCEEDED,
+            "form input completed",
+            details={"completed_fields": tuple(completed), "completed_count": len(completed)},
+        )
+
+    async def _execute_type_otp(self, action: BrowserAction) -> ActionResult:
+        code = action.arguments.get("code")
+        if not isinstance(code, str):
+            return _failed_action("invalid_arguments", "type_otp requires a string 'code' argument")
+        try:
+            control_target, control = await self._resolve_control(action.target, "type_otp")
+        except (StaleTargetError, ValueError) as error:
+            return _failed_action(
+                _target_error_code(error), "verification-code target is stale or unavailable"
+            )
+        if "disabled" in control.states:
+            return _failed_action("disabled", "verification-code control is disabled")
+        if "readonly" in control.states:
+            return _failed_action("readonly", "verification-code control is readonly")
+        result = await type_otp(
+            control_target.session, control_target.backend_node_id, code, self._config.timeouts
+        )
+        if result.status in {OutcomeStatus.SUCCEEDED, OutcomeStatus.UNCERTAIN}:
+            self._redacted_backend_node_ids.add(control_target.backend_node_id)
+            if code:
+                self._redaction_tokens.add(code)
+        return result
+
+    async def _execute_select_option(self, action: BrowserAction) -> ActionResult:
+        label = action.arguments.get("label", action.arguments.get("value"))
+        if not isinstance(label, str):
+            return _failed_action(
+                "invalid_arguments", "select_option requires a string 'label' argument"
+            )
+        try:
+            control_target, control = await self._resolve_control(action.target, "select_option")
+        except (StaleTargetError, ValueError) as error:
+            return _failed_action(
+                _target_error_code(error), "select target is stale or unavailable"
+            )
+        if "disabled" in control.states:
+            return _failed_action("disabled", "select control is disabled")
+        if not control.visible:
+            return _failed_action("target_obscured", "select control is not visible")
+        return await select_option(
+            control_target.session, control_target.backend_node_id, label, self._config.timeouts
+        )
+
+    async def _execute_scroll(self, action: BrowserAction) -> ActionResult:
+        direction = action.arguments.get("direction")
+        if direction not in {"up", "down"}:
+            return _failed_action("invalid_arguments", "scroll direction must be 'up' or 'down'")
+        viewport = await read_viewport(self._browser.main_tab)
+        delta = viewport.height * (0.9 if direction == "down" else -0.9)
+        await self._browser.main_tab.send(
+            cdp.input_.dispatch_mouse_event(
+                "mouseWheel", x=viewport.width / 2, y=viewport.height / 2, delta_y=delta
+            )
+        )
+        await asyncio.sleep(self._config.timeouts.settle)
+        return ActionResult(OutcomeStatus.SUCCEEDED, f"scrolled {direction}")
+
+    async def _execute_back(self) -> ActionResult:
+        current_index, entries = await self._browser.main_tab.send(
+            cdp.page.get_navigation_history()
+        )
+        if current_index <= 0 or not entries:
+            return _failed_action("history_empty", "no previous page is available")
+        await self._browser.main_tab.send(
+            cdp.page.navigate_to_history_entry(entries[current_index - 1].id_)
+        )
+        await asyncio.sleep(self._config.timeouts.settle)
+        return ActionResult(OutcomeStatus.SUCCEEDED, "back navigation dispatched")
+
+    async def _execute_read_page(self) -> ActionResult:
+        return await self._evaluate_read(
+            """(() => (document.body ? document.body.innerText : '').replace(/\\n{3,}/g, '\\n\\n')
+                .trim().slice(0, 8000))()""",
+            "page read completed",
+            "text",
+        )
+
+    async def _execute_get_html(self) -> ActionResult:
+        return await self._evaluate_read(
+            """(() => {
+                const root = document.documentElement.cloneNode(true);
+                root.querySelectorAll('script,style,noscript,svg,link,meta,template').forEach(
+                    (node) => node.remove());
+                root.querySelectorAll('input[type=password],input[autocomplete*=password]').forEach(
+                    (node) => { node.value = ''; node.setAttribute('value', ''); });
+                return root.outerHTML.replace(/\\s{2,}/g, ' ').slice(0, 14000);
+            })()""",
+            "HTML read completed",
+            "html",
+        )
+
+    async def _evaluate_read(self, expression: str, message: str, detail_name: str) -> ActionResult:
+        result, exception = await self._browser.main_tab.send(
+            # This expression is adapter-owned and operates on a detached clone
+            # when it needs DOM cleanup; V8 otherwise rejects it as a possible
+            # side effect despite no mutation of the active document.
+            cdp.runtime.evaluate(expression, return_by_value=True)
+        )
+        if exception is not None:
+            return _failed_action("evaluation_failed", f"{message[:-10]} failed")
+        value = result.value if isinstance(result.value, str) else ""
+        return ActionResult(
+            OutcomeStatus.SUCCEEDED, message, details={detail_name: self._redact_text(value)}
+        )
+
+    async def _execute_screenshot(self) -> ActionResult:
+        data = await self._browser.main_tab.send(
+            cdp.page.capture_screenshot(
+                format_="png", from_surface=True, capture_beyond_viewport=False
+            )
+        )
+        return ActionResult(
+            OutcomeStatus.SUCCEEDED,
+            "screenshot captured",
+            details={"mime_type": "image/png", "data": data},
+        )
+
+    async def _execute_viewport(self) -> ActionResult:
+        viewport = await read_viewport(self._browser.main_tab)
+        return ActionResult(
+            OutcomeStatus.SUCCEEDED,
+            "viewport read completed",
+            details={
+                "width": viewport.width,
+                "height": viewport.height,
+                "device_scale": viewport.device_scale,
+                "offset_x": viewport.offset_x,
+                "offset_y": viewport.offset_y,
+                "scale": viewport.scale,
+                "scroll_x": viewport.scroll_x,
+                "scroll_y": viewport.scroll_y,
+            },
+        )
+
+    async def _execute_evaluate(self, action: BrowserAction) -> ActionResult:
+        expression = action.arguments.get("expression")
+        if not isinstance(expression, str):
+            return _failed_action(
+                "invalid_arguments", "evaluate requires a string 'expression' argument"
+            )
+        result, exception = await self._browser.main_tab.send(
+            cdp.runtime.evaluate(
+                expression,
+                return_by_value=True,
+                throw_on_side_effect=True if action.read_only else None,
+            )
+        )
+        if exception is not None:
+            return _failed_action("evaluation_failed", "JavaScript evaluation failed")
+        value = self._redact_text(result.value) if isinstance(result.value, str) else result.value
+        return ActionResult(
+            OutcomeStatus.SUCCEEDED,
+            "JavaScript evaluation completed",
+            details={"value": value},
+        )
+
+    def _redact_text(self, value: str) -> str:
+        redacted = value
+        for token in self._redaction_tokens:
+            redacted = redacted.replace(token, "[REDACTED]")
+        return redacted
 
     async def _execute_click_at(self, action: BrowserAction) -> ActionResult:
         observation_id = action.arguments.get("observation_id")
@@ -275,6 +590,38 @@ def _finite_coordinate(value: object, name: str) -> float:
     if not math.isfinite(coordinate):
         raise ValueError(f"click_at {name} coordinate must be a finite number")
     return coordinate
+
+
+def _failed_action(code: str, message: str) -> ActionResult:
+    return ActionResult(OutcomeStatus.FAILED, message, error_code=code, retryable=False)
+
+
+def _target_error_code(error: Exception) -> str:
+    return "stale_target" if isinstance(error, StaleTargetError) else "invalid_target"
+
+
+def _form_stop(completed: list[str], code: str, message: str) -> ActionResult:
+    status = OutcomeStatus.PARTIAL if completed else OutcomeStatus.FAILED
+    return ActionResult(
+        status,
+        f"form input stopped: {message}",
+        error_code=code,
+        retryable=False,
+        details={"completed_fields": tuple(completed), "completed_count": len(completed)},
+    )
+
+
+def _bounds_contain(
+    outer: tuple[float, float, float, float] | None,
+    inner: tuple[float, float, float, float] | None,
+) -> bool:
+    if outer is None or inner is None:
+        return False
+    left, top, right, bottom = outer
+    inner_left, inner_top, inner_right, inner_bottom = inner
+    return (
+        left <= inner_left and top <= inner_top and inner_right <= right and inner_bottom <= bottom
+    )
 
 
 def _resolve_executable(configured: Path | None) -> Path:
