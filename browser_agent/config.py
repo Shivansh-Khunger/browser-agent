@@ -27,6 +27,13 @@ DEBUG_TOKENS = bool(os.environ.get("AGENT_DEBUG_TOKENS"))
 # --- browser ---------------------------------------------------------------
 
 HEADLESS = os.environ.get("HEADLESS") == "true"
+BROWSER_EXECUTABLE = (
+    Path(os.environ["AGENT_BROWSER_EXECUTABLE"])
+    if os.environ.get("AGENT_BROWSER_EXECUTABLE")
+    else None
+)
+STATE_ROOT = Path(os.environ.get("AGENT_STATE_ROOT", ".profile/state"))
+STATE_ENCRYPTION_KEY = os.environ.get("AGENT_STATE_ENCRYPTION_KEY")
 # Cookies/localStorage carried across runs, so a site stays logged in.
 STATE_FILE = Path(os.environ.get("AGENT_STATE_FILE", ".profile/state.json"))
 # Persistent user facts the agent may read and write.

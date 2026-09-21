@@ -275,6 +275,10 @@ class FakeBrowserSession:
         del reason
         raise NotImplementedError
 
+    async def invalidate(self, error: BaseException) -> None:
+        del error
+        await self.close()
+
     async def close(self) -> None:
         if self._lifecycle is SessionLifecycle.CLOSED:
             return

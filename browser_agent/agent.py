@@ -1,26 +1,33 @@
-"""The OpenRouter tool-use loop.
-
-A persistent agent: one browser session and one conversation history that
-survive across multiple `run()` calls, so follow-up prompts continue in the same
-browser with full context (Claude Code / opencode style).
-
-Each step: snapshot the page -> ask the model for exactly one tool call ->
-execute it -> feed back the result plus the fresh page. Three guards wrap that
-loop: a code-enforced confirmation prompt for consequential clicks, a hard
-anti-repeat refusal, and a second "supervisor" model that steers the agent out
-of loops. Every string the model reads lives in `prompts.py`.
-"""
+# OpenAI response/tool payloads are deliberately dynamic at this adapter boundary.
+# pyright: reportUnknownArgumentType=false
+# pyright: reportUnknownMemberType=false
+# pyright: reportUnknownVariableType=false
+# pyright: reportCallIssue=false
+# pyright: reportArgumentType=false
+"""Asynchronous model/tool loop over the public browser-session contract."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
-from typing import Any, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any, Protocol
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from . import prompts
-from .browser.session import BrowserSession, PageState
+from .browser import (
+    ActionResult,
+    BrowserAction,
+    BrowserSession,
+    Observation,
+    OutcomeStatus,
+    SemanticControl,
+    TargetHandle,
+)
 from .config import (
     API_KEY,
     CHECK_EVERY,
@@ -32,119 +39,217 @@ from .config import (
     VISION,
 )
 from .memory import format_memory, load_memory, save_memory
-from .tools import READ_TOOLS, TOOLS, execute
+from .tools import READ_TOOLS, REGISTRY, TOOLS
 
-# Prompts the user mid-task and returns their typed answer.
-AskFn = Callable[[str], str]
+AskFn = Callable[[str], Awaitable[str]]
+WriteFn = Callable[[str], None]
 
 
-# --- rendering the page for the model --------------------------------------
+class ChatClient(Protocol):
+    @property
+    def chat(self) -> Any: ...
 
-# Text that marks an overlay as a *dismissable interruption* (cookie/consent/
-# privacy banners, newsletter/promo interstitials) rather than on-task UI like a
-# cart drawer, location picker, address list, or product-options sheet.
+
+class AutomationOutcome(StrEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class TaskResult:
+    answer: str
+    automation_outcome: AutomationOutcome
+    human_interventions: tuple[str, ...] = ()
+
+
 _DISMISS_HINTS = (
-    "cookie", "consent", "gdpr", "we use cookies", "accept all", "accept cookies",
-    "manage preferences", "privacy policy", "newsletter", "subscribe",
-    "sign up for", "% off your first", "no thanks", "maybe later", "allow all",
+    "cookie",
+    "consent",
+    "gdpr",
+    "we use cookies",
+    "accept all",
+    "accept cookies",
+    "manage preferences",
+    "privacy policy",
+    "newsletter",
+    "subscribe",
+    "sign up for",
+    "% off your first",
+    "no thanks",
+    "maybe later",
+    "allow all",
 )
-# Roles that mean "there is something to type or choose here". aria maps every
-# text-entry element onto one of these (<textarea> -> textbox, <select> ->
-# combobox, <input type=email> -> textbox), so the role alone is enough.
 _FILLABLE_ROLES = ("textbox", "searchbox", "combobox")
+_VERIFICATION_HINT = re.compile(
+    r"captcha|human verification|verify you are human|unusual traffic|cloudflare|turnstile",
+    re.IGNORECASE,
+)
 
 
-def _overlay_kind(overlays: list[dict]) -> str:
-    """Classify an open overlay: 'form' (has fields to fill), 'dismiss' (a
-    cookie/consent/promo blocker), or 'engage' (on-task dialog to interact with —
-    the default for modern sites, where cart/location/address/options live in
-    modals)."""
-    if any(e.get("role") in _FILLABLE_ROLES for e in overlays):
-        return "form"
-    blob = " ".join(e.get("text", "") for e in overlays).lower()
-    if any(h in blob for h in _DISMISS_HINTS):
-        return "dismiss"
-    return "engage"
+def _control_text(control: SemanticControl) -> str:
+    bits = [control.role, control.name]
+    if control.description:
+        bits.append(control.description)
+    if control.value is not None:
+        bits.append(f"value={control.value!r}")
+    if control.states:
+        bits.append(f"states={','.join(sorted(control.states))}")
+    if control.frame_breadcrumb:
+        bits.append(f"frame={' > '.join(control.frame_breadcrumb)}")
+    if control.fallback_reason:
+        bits.append(f"fallback={control.fallback_reason}")
+    return " ".join(bit for bit in bits if bit)
 
 
-_BANNERS = {
-    "form": prompts.FORM_BANNER,
-    "dismiss": prompts.DISMISS_BANNER,
-    "engage": prompts.ENGAGE_BANNER,
-}
-
-
-def render_state(state: PageState) -> str:
-    """PageState -> the text block the model reads: URL, title, an overlay banner
-    if a dialog is open, then a semantic outline where every control keeps the
-    [index] the model acts by."""
-    overlays = [e for e in state["elements"] if e.get("overlay")]
+def _legacy_render_state(state: Mapping[str, Any]) -> str:
+    """Keep pure-helper compatibility until old-backend deletion in issue #21."""
+    elements = list(state["elements"])
+    overlays = [item for item in elements if item.get("overlay")]
     out = f"URL: {state['url']}\nTitle: {state['title']}\n\n"
-
     if overlays:
-        out += _BANNERS[_overlay_kind(overlays)]
-        out += "\n".join(f"[{e['index']}] {e['text']}" for e in overlays) + "\n\n"
-
-    # Headings and status text give context; controls carry their index.
-    lines = []
-    for n in state["nodes"]:
-        if n.get("overlay"):
-            continue  # shown in the banner above
-        if n["kind"] == "heading":
-            lines.append(f"# {n.get('name', '')}")
-        elif n["kind"] == "text":
-            lines.append(f"- {n.get('name', '')}")
+        if any(item.get("role") in _FILLABLE_ROLES for item in overlays):
+            banner = prompts.FORM_BANNER
         else:
-            lines.append(f"[{n['index']}] {n['text']}")
-    has_control = any(n["kind"] == "control" and not n.get("overlay") for n in state["nodes"])
-    return out + "Page outline:\n" + ("\n".join(lines) if has_control else "(no interactive elements)")
+            text = " ".join(item.get("text", "") for item in overlays).lower()
+            banner = (
+                prompts.DISMISS_BANNER
+                if any(hint in text for hint in _DISMISS_HINTS)
+                else prompts.ENGAGE_BANNER
+            )
+        out += banner
+        out += "\n".join(f"[{item['index']}] {item['text']}" for item in overlays) + "\n\n"
+    lines: list[str] = []
+    for node in state["nodes"]:
+        if node.get("overlay"):
+            continue
+        if node["kind"] == "heading":
+            lines.append(f"# {node.get('name', '')}")
+        elif node["kind"] == "text":
+            lines.append(f"- {node.get('name', '')}")
+        else:
+            lines.append(f"[{node['index']}] {node['text']}")
+    has_control = any(
+        node["kind"] == "control" and not node.get("overlay") for node in state["nodes"]
+    )
+    return (
+        out + "Page outline:\n" + ("\n".join(lines) if has_control else "(no interactive elements)")
+    )
 
 
-# --- stuck detection -------------------------------------------------------
+def render_state(state: Observation | Mapping[str, Any]) -> str:
+    """Render one observation into bounded model-facing text."""
+    if not isinstance(state, Observation):
+        return _legacy_render_state(state)
+    lines = [f"URL: {state.url}", f"Title: {state.title}", "", "Page outline:"]
+    for node in state.context:
+        marker = "#" if node.kind == "heading" else "-"
+        breadcrumb = (
+            f" [frame: {' > '.join(node.frame_breadcrumb)}]" if node.frame_breadcrumb else ""
+        )
+        lines.append(f"{marker} {node.text}{breadcrumb}")
+    for index, control in enumerate(state.controls):
+        lines.append(f"[{index}] {_control_text(control)}")
+    if not state.controls:
+        lines.append("(no interactive elements)")
+    for region in state.unsupported_regions:
+        breadcrumb = " > ".join(region.frame_breadcrumb) or "active document"
+        lines.append(f"- Unsupported region ({region.reason}) in {breadcrumb}")
+    if state.truncated:
+        omitted = ", ".join(f"{key}={value}" for key, value in state.omitted_counts.items())
+        lines.append(f"- Observation truncated{': ' + omitted if omitted else ''}")
+    lines.extend(f"- Warning: {warning}" for warning in state.warnings)
+    return "\n".join(lines)
 
 
 def looks_like_loop(actions: list[str]) -> bool:
-    """Cheap, free loop heuristics over recent action signatures."""
-    if len(actions) >= 3 and all(a == actions[-1] for a in actions[-3:]):
-        return True  # same action 3x in a row
+    if len(actions) >= 3 and all(action == actions[-1] for action in actions[-3:]):
+        return True
     if len(actions) >= 4:
         a, b, c, d = actions[-4:]
-        if a == c and b == d and a != b:
-            return True  # A-B-A-B oscillation
+        return a == c and b == d and a != b
     return False
 
 
 def looks_stalled(state_sigs: list[str]) -> bool:
-    """Page hasn't changed across the last few steps despite taking actions."""
-    if len(state_sigs) < 4:
-        return False
-    last4 = state_sigs[-4:]
-    return all(s == last4[0] for s in last4)
+    return len(state_sigs) >= 4 and len(set(state_sigs[-4:])) == 1
 
 
-def repeat_guard_step(action_sig, sig, last_action_sig, last_state_sig, recent_sigs, stuck_repeats):
-    """Anti-repeat bookkeeping for one browser action (pure, so it's testable).
-
-    `sig` is the page signature AFTER the action. An action is "stuck" if it
-    repeats the previous action AND the page either didn't change or bounced back
-    to a recently-seen state (an open/close toggle). Returns (stuck, new_count).
-    Callers refuse to execute the same action once the count reaches 2."""
+def repeat_guard_step(
+    action_sig: str,
+    sig: str,
+    last_action_sig: str | None,
+    last_state_sig: str | None,
+    recent_sigs: list[str],
+    stuck_repeats: int,
+) -> tuple[bool, int]:
     stuck = action_sig == last_action_sig and (sig == last_state_sig or sig in recent_sigs)
     return stuck, (stuck_repeats + 1 if stuck else 0)
 
 
-def page_signature(state: PageState) -> str:
-    """A cheap fingerprint of a page, for spotting "nothing changed"."""
-    return f"{state['url']}#{len(state['elements'])}#" + "|".join(
-        e["text"] for e in state["elements"][:6]
+def page_signature(state: Observation | Mapping[str, Any]) -> str:
+    if not isinstance(state, Observation):
+        elements = list(state["elements"])
+        return f"{state['url']}#{len(elements)}#" + "|".join(item["text"] for item in elements[:6])
+    controls = "|".join(_control_text(control) for control in state.controls[:6])
+    context = "|".join(node.text for node in state.context[:4])
+    return f"{state.url}#{state.document_generation}#{len(state.controls)}#{controls}#{context}"
+
+
+def _looks_like_vision_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(word in text for word in ("image", "vision", "multimodal", "modalit", "image_url"))
+
+
+def _is_anthropic(model: str) -> bool:
+    lowered = (model or "").lower()
+    return "anthropic/" in lowered or "claude" in lowered
+
+
+def _as_int(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _has_image(message: Mapping[str, Any]) -> bool:
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        isinstance(part, dict) and part.get("type") == "image_url" for part in content
     )
 
 
-def supervise(client: OpenAI, task: str, recent_actions: list[str], state_text: str) -> dict[str, Any]:
-    """A second model that judges whether the browser agent is stuck/looping and,
-    if so, returns concrete steering advice."""
+def _jsonable(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def render_action_result(result: ActionResult) -> str:
+    payload: dict[str, object] = {
+        "status": result.status.value,
+        "message": result.message,
+        "retryable": result.retryable,
+    }
+    if result.error_code:
+        payload["error_code"] = result.error_code
+    if result.details:
+        details = dict(result.details)
+        if "data" in details and isinstance(details["data"], str):
+            details["data"] = f"<base64 image: {len(details['data'])} characters>"
+        payload["details"] = _jsonable(details)
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+async def supervise(
+    client: ChatClient, task: str, recent_actions: list[str], state_text: str
+) -> dict[str, Any]:
     try:
-        r = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=CHECKER_MODEL,
             max_tokens=300,
             messages=[
@@ -157,7 +262,7 @@ def supervise(client: OpenAI, task: str, recent_actions: list[str], state_text: 
                 },
             ],
         )
-        match = re.search(r"\{[\s\S]*\}", r.choices[0].message.content or "")
+        match = re.search(r"\{[\s\S]*\}", response.choices[0].message.content or "")
         if not match:
             return {"looping": False, "advice": ""}
         parsed = json.loads(match.group(0))
@@ -166,48 +271,31 @@ def supervise(client: OpenAI, task: str, recent_actions: list[str], state_text: 
         return {"looping": False, "advice": ""}
 
 
-# --- small helpers ---------------------------------------------------------
-
-
-def _looks_like_vision_error(err: Exception) -> bool:
-    """Heuristic: did the API reject the request because of image input (model
-    isn't multimodal)? Kept loose so we degrade gracefully rather than crash."""
-    s = str(err).lower()
-    return any(k in s for k in ("image", "vision", "multimodal", "modalit", "image_url"))
-
-
-def _is_anthropic(model: str) -> bool:
-    m = (model or "").lower()
-    return "anthropic/" in m or "claude" in m
-
-
-def _as_int(v):
-    try:
-        return int(v)
-    except Exception:
-        return None
-
-
-def _has_image(msg: dict) -> bool:
-    return isinstance(msg.get("content"), list) and any(
-        isinstance(p, dict) and p.get("type") == "image_url" for p in msg["content"]
-    )
-
-
 class Agent:
-    def __init__(self) -> None:
-        self.browser = BrowserSession()
-        self._vision_on = VISION  # may flip off at runtime if the model rejects images
+    """Persistent conversation and browser session; task outcome resets per run."""
+
+    def __init__(
+        self,
+        browser: BrowserSession,
+        *,
+        client: ChatClient | None = None,
+        write: WriteFn = print,
+    ) -> None:
+        self.browser = browser
+        self._vision_on = VISION
+        self._write = write
+        self._started = False
+        self._invalidated = False
+        self._task_interventions: list[str] = []
         system = prompts.SYSTEM + ("\n\n" + prompts.VISION_NOTE if VISION else "")
-        # Prefix caching: the system prompt is a large static prefix. On Anthropic
-        # models (via OpenRouter) mark it cacheable; Google/OpenAI cache implicitly
-        # so a plain string is fine there.
-        sys_content: Any = system
+        system_content: Any = system
         if _is_anthropic(MODEL):
-            sys_content = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
-        self.messages: list[dict[str, Any]] = [{"role": "system", "content": sys_content}]
+            system_content = [
+                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+            ]
+        self.messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
         self.memory = load_memory()
-        self.client = OpenAI(
+        self.client = client or AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=API_KEY,
             default_headers={
@@ -216,109 +304,118 @@ class Agent:
             },
         )
 
-    def start(self, headless: bool) -> None:
-        self.browser.launch(headless)
+    async def start(self) -> None:
+        if self._started:
+            return
+        await self.browser.start()
+        self._started = True
         if self._vision_on:
-            print(
+            self._write(
                 f"👁️  Vision ON — sending a screenshot each turn. "
                 f"AGENT_MODEL must be multimodal (current: {MODEL}). Set AGENT_VISION=0 to disable."
             )
 
-    def close(self) -> None:
-        self.browser.close()
+    async def close(self) -> None:
+        await self.browser.close()
+        self._started = False
 
-    # --- model I/O ---------------------------------------------------------
-
-    def _attach_screenshot(self) -> None:
-        """Append a user message carrying a screenshot of the current page, so a
-        multimodal model can see it alongside the text element list. No-op if
-        vision is off or the capture fails. Old screenshots are pruned to the
-        latest by _compact_history so image tokens stay bounded."""
+    async def _capture_screenshot(self) -> None:
         if not self._vision_on:
             return
-        shot = self.browser.screenshot_b64()
-        if not shot:
+        try:
+            result = await self.browser.execute(BrowserAction("screenshot", read_only=True))
+        except Exception:
             return
-        vp = self.browser.viewport()
-        label = prompts.SHOT_LABEL + prompts.SHOT_COORDS.format(
-            w=int(vp.get("w", 1280)), h=int(vp.get("h", 900))
-        )
+        data = result.details.get("data")
+        if result.status is not OutcomeStatus.SUCCEEDED or not isinstance(data, str):
+            return
+        observation = result.observation
+        viewport = observation.viewport if observation is not None else None
+        label = prompts.SHOT_LABEL
+        if viewport is not None:
+            label += prompts.SHOT_COORDS.format(w=int(viewport.width), h=int(viewport.height))
         self.messages.append(
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": label},
-                    {"type": "image_url", "image_url": {"url": shot}},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}},
                 ],
             }
         )
 
     def _disable_vision(self) -> None:
-        """Turn vision off mid-run and strip existing image messages (used when
-        the model rejects image input)."""
         self._vision_on = False
-        for m in self.messages:
-            if _has_image(m):
-                m["content"] = prompts.SHOT_OMITTED
+        for message in self.messages:
+            if _has_image(message):
+                message["content"] = prompts.SHOT_OMITTED
 
-    def _complete(self):
-        """One chat completion over the running history, with a graceful text-only
-        retry if the model turns out not to accept images."""
-        kwargs = dict(
-            model=MODEL,
-            max_tokens=4000,
-            messages=self.messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            parallel_tool_calls=False,
-        )
+    async def _complete(self) -> Any:
+        kwargs = {
+            "model": MODEL,
+            "max_tokens": 4000,
+            "messages": self.messages,
+            "tools": TOOLS,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        }
         try:
-            return self.client.chat.completions.create(**kwargs)
-        except Exception as err:
-            if self._vision_on and _looks_like_vision_error(err):
-                print(
-                    "\n⚠️  The model rejected image input — disabling vision and retrying text-only. "
-                    "Use a multimodal AGENT_MODEL to enable vision."
+            return await self.client.chat.completions.create(**kwargs)
+        except Exception as error:
+            if self._vision_on and _looks_like_vision_error(error):
+                self._write(
+                    "⚠️  Model rejected image input — disabling vision and retrying text-only."
                 )
                 self._disable_vision()
-                return self.client.chat.completions.create(**kwargs)
+                return await self.client.chat.completions.create(**kwargs)
             raise
 
     def _compact_history(self) -> None:
-        """Strip stale page snapshots / HTML dumps / screenshots from history,
-        keeping only the most recent of each. Rewrites content in place (roles +
-        tool_call_ids are preserved, so the tool-call contract stays intact)."""
-        msgs = self.messages
+        messages = self.messages
 
-        def text_indices(predicate):
-            return [i for i, m in enumerate(msgs) if isinstance(m.get("content"), str) and predicate(m["content"])]
+        def text_indices(predicate: Callable[[str], bool]) -> list[int]:
+            return [
+                index
+                for index, message in enumerate(messages)
+                if isinstance(message.get("content"), str) and predicate(message["content"])
+            ]
 
-        for i in text_indices(lambda c: prompts.PAGE_MARK in c)[:-1]:
-            msgs[i]["content"] = msgs[i]["content"].split(prompts.PAGE_MARK, 1)[0] + prompts.PAGE_NOTE
+        for index in text_indices(lambda content: prompts.PAGE_MARK in content)[:-1]:
+            content = messages[index]["content"]
+            messages[index]["content"] = content.split(prompts.PAGE_MARK, 1)[0] + prompts.PAGE_NOTE
 
-        def is_html(c):
-            return c.startswith(prompts.HTML_PREFIX) or prompts.SUP_MARK in c
+        def is_html(content: str) -> bool:
+            return content.startswith(prompts.HTML_PREFIX) or prompts.SUP_MARK in content
 
-        for i in text_indices(is_html)[:-1]:
-            c = msgs[i]["content"]
-            msgs[i]["content"] = (
+        for index in text_indices(is_html)[:-1]:
+            content = messages[index]["content"]
+            messages[index]["content"] = (
                 prompts.HTML_PREFIX + prompts.HTML_NOTE
-                if c.startswith(prompts.HTML_PREFIX)
-                else c.split(prompts.SUP_MARK, 1)[0] + prompts.HTML_NOTE
+                if content.startswith(prompts.HTML_PREFIX)
+                else content.split(prompts.SUP_MARK, 1)[0] + prompts.HTML_NOTE
             )
+        for index in [i for i, message in enumerate(messages) if _has_image(message)][:-1]:
+            messages[index]["content"] = prompts.SHOT_OMITTED
 
-        # Screenshots are large — keep only the latest image.
-        for i in [i for i, m in enumerate(msgs) if _has_image(m)][:-1]:
-            msgs[i]["content"] = prompts.SHOT_OMITTED
+    def _mark_intervention(self, reason: str) -> None:
+        self._task_interventions.append(reason)
 
-    # --- per-step pieces of run() -----------------------------------------
+    async def _ask(self, ask: AskFn, question: str, reason: str) -> str:
+        self._mark_intervention(reason)
+        return (await ask(question)).strip()
 
-    def _pause_for_captcha(self, ask: AskFn) -> PageState:
-        """Hand the browser to the human until the challenge is cleared, then
-        resync the model on the page it lands on."""
-        print("\n🧩 CAPTCHA / human-verification detected. Waiting for you to solve it…")
-        answer = ask(prompts.CAPTCHA_PAUSE)
-        state = self.browser.get_state()
+    @staticmethod
+    def _has_verification(observation: Observation) -> bool:
+        content = " ".join(
+            [observation.title, *(node.text for node in observation.context)]
+            + [f"{control.name} {control.description}" for control in observation.controls]
+        )
+        return bool(_VERIFICATION_HINT.search(content))
+
+    async def _pause_for_verification(self, ask: AskFn) -> Observation:
+        self._write("🧩 Human verification detected. Waiting for browser intervention…")
+        answer = await self._ask(ask, prompts.CAPTCHA_PAUSE, "verification")
+        state = await self.browser.observe()
         self.messages.append(
             {
                 "role": "user",
@@ -330,192 +427,281 @@ class Agent:
         )
         return state
 
-    def _meta_tool_result(self, name: str, inp: dict, ask: AskFn) -> str | None:
-        """Handle the tools the loop owns rather than the browser. Returns the
-        tool-message content, or None if `name` isn't one of them."""
+    async def _meta_tool_result(self, name: str, inp: dict[str, Any], ask: AskFn) -> str | None:
         if name == "ask_user":
-            answer = ask(str(inp.get("question", "(the agent has a question)"))).strip()
+            answer = await self._ask(
+                ask, str(inp.get("question", "(agent has a question)")), "user_input"
+            )
             return f"User answered: {answer}" if answer else "User gave no answer."
         if name == "remember":
             key = str(inp.get("key", "")).strip()
             value = str(inp.get("value", "")).strip()
             if key:
                 self.memory[key] = value
-                save_memory(self.memory)
-                print(f"\n💾 Remembered: {key} = {value}")
+                await asyncio.to_thread(save_memory, self.memory)
+                self._write(f"💾 Remembered: {key} = {value}")
             return f"Saved: {key} = {value}"
         if name == "forget":
             key = str(inp.get("key", "")).strip()
             if key in self.memory:
                 del self.memory[key]
-                save_memory(self.memory)
-                print(f"\n🗑️  Forgot: {key}")
+                await asyncio.to_thread(save_memory, self.memory)
+                self._write(f"🗑️  Forgot: {key}")
             return f"Deleted: {key}"
         return None
 
     @staticmethod
-    def _confirm_target(name: str, inp: dict, elements: list) -> str | None:
-        """The label of a consequential element this call would activate, if any.
-        Code-enforced, not the model's choice — a prompt injection can't skip it."""
-        if not CONFIRM_KEYWORDS or name not in ("click", "fill_form"):
+    def _confirm_target(name: str, inp: dict[str, Any], state: Observation) -> str | None:
+        if not CONFIRM_KEYWORDS or name not in {"click", "fill_form"}:
             return None
-        if name == "click":
-            indices = [_as_int(inp.get("index"))]
-        else:  # fill_form — only a field that presses Enter can submit
-            indices = [_as_int(f.get("index")) for f in inp.get("fields") or [] if f.get("submit")]
-        labels = [elements[i]["text"] for i in indices if i is not None and 0 <= i < len(elements)]
-        return next((t for t in labels if any(k in t.lower() for k in CONFIRM_KEYWORDS)), None)
+        indices = [_as_int(inp.get("index"))]
+        if name == "fill_form":
+            indices = [
+                _as_int(field.get("index"))
+                for field in inp.get("fields") or []
+                if isinstance(field, dict) and field.get("submit")
+            ]
+        labels = [
+            _control_text(state.controls[index])
+            for index in indices
+            if index is not None and 0 <= index < len(state.controls)
+        ]
+        return next(
+            (label for label in labels if any(word in label.lower() for word in CONFIRM_KEYWORDS)),
+            None,
+        )
 
-    def _maybe_steer(self, task: str, actions: list, state_text: str) -> bool:
-        """Ask the supervisor whether the agent is stuck; if so, inject steering
-        advice plus the raw HTML. Returns True if it steered."""
-        verdict = supervise(self.client, task, actions[-8:], state_text)
+    @staticmethod
+    def _target(state: Observation, value: object) -> TargetHandle:
+        index = _as_int(value)
+        if index is None or index < 0 or index >= len(state.controls):
+            raise ValueError(f"No control with index {value!r} in current observation")
+        return state.controls[index].handle
+
+    @classmethod
+    def _browser_action(cls, name: str, inp: dict[str, Any], state: Observation) -> BrowserAction:
+        entry = REGISTRY.get(name)
+        if entry is None or entry["run"] is None:
+            raise ValueError(f"Unknown tool: {name}")
+        read_only = bool(entry["read_only"])
+        backend_name = "back" if name == "go_back" else name
+        arguments: dict[str, object] = dict(inp)
+        target: TargetHandle | None = None
+        if name in {"click", "type", "type_otp", "select_option"}:
+            target = cls._target(state, inp.get("index"))
+            arguments.pop("index", None)
+        elif name == "fill_form":
+            fields: list[dict[str, object]] = []
+            raw_fields = inp.get("fields")
+            if not isinstance(raw_fields, list):
+                raise ValueError("fill_form requires a fields list")
+            for field in raw_fields:
+                if not isinstance(field, dict):
+                    raise ValueError("fill_form fields must be objects")
+                converted = dict(field)
+                converted["target"] = cls._target(state, field.get("index"))
+                converted.pop("index", None)
+                fields.append(converted)
+            arguments = {"fields": fields}
+        elif name == "click_at":
+            screenshot = state.screenshot
+            if screenshot is None:
+                raise ValueError("current observation has no screenshot metadata")
+            arguments.update(
+                observation_id=state.observation_id, screenshot_id=screenshot.screenshot_id
+            )
+        return BrowserAction(backend_name, arguments, target=target, read_only=read_only)
+
+    async def _maybe_steer(self, task: str, actions: list[str], state_text: str) -> bool:
+        verdict = await supervise(self.client, task, actions[-8:], state_text)
         if not (verdict["looping"] and verdict["advice"].strip()):
             return False
-        print(f"\n🧭 supervisor: {verdict['advice'].strip()}")
+        advice = verdict["advice"].strip()
+        self._write(f"🧭 supervisor: {advice}")
+        html = ""
+        try:
+            result = await self.browser.execute(BrowserAction("get_html", read_only=True))
+            html = str(result.details.get("html", ""))
+        except Exception:
+            pass
         self.messages.append(
             {
                 "role": "user",
-                "content": prompts.SUPERVISOR_INJECT.format(
-                    advice=verdict["advice"].strip(), html=self.browser.read_html()
-                ),
+                "content": prompts.SUPERVISOR_INJECT.format(advice=advice, html=html),
             }
         )
         return True
 
-    # --- the loop ---------------------------------------------------------
+    async def run(self, task: str, ask: AskFn) -> TaskResult:
+        if not self._started or self._invalidated:
+            raise RuntimeError("agent browser session is not running")
+        self._task_interventions = []
+        try:
+            return await self._run_task(task, ask)
+        except asyncio.CancelledError:
+            self._invalidated = True
+            try:
+                async with asyncio.timeout(self.browser.config.timeouts.shutdown):
+                    await asyncio.shield(
+                        self.browser.invalidate(asyncio.CancelledError("task cancelled"))
+                    )
+            except BaseException:
+                pass
+            raise
 
-    def run(self, task: str, ask: AskFn) -> str:
-        """Run one task to completion, keeping the browser + history for follow-ups."""
-        state = self.browser.get_state()
+    async def _run_task(self, task: str, ask: AskFn) -> TaskResult:
+        state = await self.browser.observe()
         state_text = render_state(state)
-        elements = state["elements"]  # for the sensitive-action guard
-        confirmed: set[str] = set()  # sensitive actions the user already approved
-        mem_text = format_memory(self.memory)
+        memory = format_memory(self.memory)
         self.messages.append(
             {
                 "role": "user",
-                "content": (f"What you know about this user:\n{mem_text}\n\n" if mem_text else "")
+                "content": (f"What you know about this user:\n{memory}\n\n" if memory else "")
                 + f"Task: {task}{prompts.PAGE_MARK}{state_text}",
             }
         )
-
-        actions: list[str] = []  # action signatures, for loop heuristics
-        state_sigs: list[str] = []  # page signatures after each real action
+        actions: list[str] = []
+        state_sigs: list[str] = []
         last_steer = -99
-        last_action_sig = None  # previous browser action, for the anti-repeat guard
-        last_state_sig = None
-        stuck_repeats = 0  # consecutive futile repeats of the same action
+        last_action_sig: str | None = None
+        last_state_sig: str | None = None
+        stuck_repeats = 0
+        confirmed: set[str] = set()
 
         for step in range(1, MAX_STEPS + 1):
-            if self.browser.detect_captcha():
-                state = self._pause_for_captcha(ask)
-                state_text, elements = render_state(state), state["elements"]
-
-            # ALWAYS send a fresh screenshot each turn (when vision is on),
-            # captured now — after the previous turn's actions have fully settled.
-            # This is what lets the model see everything, including stacked
-            # modals and anything that renders a beat late.
-            self._attach_screenshot()
+            if self._has_verification(state):
+                state = await self._pause_for_verification(ask)
+                state_text = render_state(state)
+            await self._capture_screenshot()
             self._compact_history()
-
-            response = self._complete()
+            response = await self._complete()
             self._debug_tokens(step, response)
-
             message = response.choices[0].message if response.choices else None
             if message is None:
-                return "(no response from model)"
-            self.messages.append(message.model_dump(exclude_none=True))
+                return self._result("(no response from model)")
+            dumped = (
+                message.model_dump(exclude_none=True)
+                if hasattr(message, "model_dump")
+                else {
+                    "role": "assistant",
+                    "content": getattr(message, "content", None),
+                    "tool_calls": getattr(message, "tool_calls", None),
+                }
+            )
+            self.messages.append(dumped)
             if message.content and message.content.strip():
-                print(f"\n💭 {message.content.strip()}")
-
-            calls = [c for c in (message.tool_calls or []) if getattr(c, "type", "function") == "function"]
+                self._write(f"💭 {message.content.strip()}")
+            calls = [
+                call
+                for call in (message.tool_calls or [])
+                if getattr(call, "type", "function") == "function"
+            ]
             if not calls:
-                # Model ended without a tool call — treat its text as the result.
-                return (message.content or "").strip() or "(agent stopped without a final answer)"
+                return self._result(
+                    (message.content or "").strip() or "(agent stopped without a final answer)"
+                )
 
-            acted = False  # a browser action ran this step (gates the supervisor)
-
+            acted = False
             for call in calls:
                 name = call.function.name
                 try:
                     inp = json.loads(call.function.arguments) if call.function.arguments else {}
-                except Exception:
+                except (TypeError, json.JSONDecodeError):
                     inp = {}
-                print(f"\n🔧 {name}({json.dumps(inp)})  [step {step}/{MAX_STEPS}]")
-
+                self._write(f"🔧 {name}({json.dumps(inp)})  [step {step}/{MAX_STEPS}]")
                 if name == "done":
-                    self.browser.screenshot("run-final.png")
                     self._reply(call, "done")
-                    return str(inp.get("answer", "(no answer provided)"))
-
-                meta = self._meta_tool_result(name, inp, ask)
+                    return self._result(str(inp.get("answer", "(no answer provided)")))
+                meta = await self._meta_tool_result(name, inp, ask)
                 if meta is not None:
-                    self._reply(call, meta)  # no page changed; let the model react
+                    self._reply(call, meta)
                     continue
 
-                # Consequential click/submit: require an explicit human "yes" once.
-                target = self._confirm_target(name, inp, elements)
-                if target and f"{name}:{target.lower()}" not in confirmed:
-                    print(f"\n🛑 Consequential action detected: {target}")
-                    if re.match(r"\s*(y|yes|ok|sure|proceed|confirm|go)\b", ask(prompts.CONFIRM_ASK.format(label=target)), re.I):
-                        confirmed.add(f"{name}:{target.lower()}")
-                    else:
-                        self._reply(call, prompts.CONFIRM_DECLINED.format(label=target))
+                target_label = self._confirm_target(name, inp, state)
+                confirmation_key = f"{name}:{target_label.casefold()}" if target_label else None
+                if target_label and confirmation_key not in confirmed:
+                    self._write(f"🛑 Consequential action detected: {target_label}")
+                    answer = await self._ask(
+                        ask,
+                        prompts.CONFIRM_ASK.format(label=target_label),
+                        "confirmation",
+                    )
+                    if not re.match(r"\s*(y|yes|ok|sure|proceed|confirm|go)\b", answer, re.I):
+                        self._reply(call, prompts.CONFIRM_DECLINED.format(label=target_label))
                         acted = True
                         continue
+                    confirmed.add(confirmation_key)
 
-                action_sig = f"{name} {json.dumps(inp)}"
-                # Refuse to run the same futile action yet again — the soft
-                # supervisor nudge isn't enough once a model is looping.
+                action_sig = f"{name} {json.dumps(inp, sort_keys=True)}"
                 refusing = action_sig == last_action_sig and stuck_repeats >= 2
                 if refusing:
-                    result = prompts.REPEAT_REFUSAL.format(action=action_sig)
+                    result_text = prompts.REPEAT_REFUSAL.format(action=action_sig)
                 else:
                     try:
-                        result = execute(self.browser, name, inp)
-                    except Exception as err:
-                        result = f"Action failed: {err}"
+                        action = self._browser_action(name, inp, state)
+                        result = await self.browser.execute(action)
+                        result_text = render_action_result(result)
+                        if result.observation is not None:
+                            state = result.observation
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        result_text = json.dumps(
+                            {
+                                "status": OutcomeStatus.FAILED.value,
+                                "message": f"Action failed: {error}",
+                                "retryable": False,
+                            },
+                            sort_keys=True,
+                        )
 
                 if name in READ_TOOLS:
                     actions.append(name)
-                    self._reply(call, result)
+                    self._reply(call, result_text)
                 else:
-                    state = self.browser.get_state()
-                    state_text, elements = render_state(state), state["elements"]
-                    sig = page_signature(state)
+                    state_text = render_state(state)
+                    signature = page_signature(state)
                     stuck, stuck_repeats = repeat_guard_step(
-                        action_sig, sig, last_action_sig, last_state_sig, state_sigs[-5:], stuck_repeats
+                        action_sig,
+                        signature,
+                        last_action_sig,
+                        last_state_sig,
+                        state_sigs[-5:],
+                        stuck_repeats,
                     )
-                    last_action_sig, last_state_sig = action_sig, sig
+                    last_action_sig, last_state_sig = action_sig, signature
                     if stuck and not refusing:
-                        result = prompts.STUCK_WARNING + result
-                    actions.append(f"{action_sig} @ {state['url']}")
-                    state_sigs.append(sig)
-                    self._reply(call, f"{result}{prompts.PAGE_MARK}{state_text}")
+                        result_text = prompts.STUCK_WARNING + result_text
+                    actions.append(f"{action_sig} @ {state.url}")
+                    state_sigs.append(signature)
+                    self._reply(call, f"{result_text}{prompts.PAGE_MARK}{state_text}")
                 acted = True
 
             if acted:
                 due = step % CHECK_EVERY == 0
                 suspect = looks_like_loop(actions) or looks_stalled(state_sigs)
-                if (due or suspect) and step - last_steer >= 2:
-                    if self._maybe_steer(task, actions, state_text):
-                        last_steer = step
+                if (
+                    (due or suspect)
+                    and step - last_steer >= 2
+                    and await self._maybe_steer(task, actions, state_text)
+                ):
+                    last_steer = step
+        return self._result(f"Reached the step limit ({MAX_STEPS}) without finishing.")
 
-        return f"Reached the step limit ({MAX_STEPS}) without finishing."
+    def _result(self, answer: str) -> TaskResult:
+        interventions = tuple(self._task_interventions)
+        outcome = AutomationOutcome.FAILED if interventions else AutomationOutcome.SUCCEEDED
+        return TaskResult(answer, outcome, interventions)
 
-    def _reply(self, call, content: str) -> None:
-        """Answer one tool call. Every call MUST get exactly one reply or the next
-        request is malformed."""
+    def _reply(self, call: Any, content: str) -> None:
         self.messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
 
-    @staticmethod
-    def _debug_tokens(step: int, response) -> None:
+    def _debug_tokens(self, step: int, response: Any) -> None:
         if not DEBUG_TOKENS:
             return
-        u = getattr(response, "usage", None)
-        if u:
-            print(
-                f"   ⚙️  tokens step {step}: prompt={u.prompt_tokens} "
-                f"completion={u.completion_tokens} total={u.total_tokens}"
+        usage = getattr(response, "usage", None)
+        if usage:
+            self._write(
+                f"⚙️  tokens step {step}: prompt={usage.prompt_tokens} "
+                f"completion={usage.completion_tokens} total={usage.total_tokens}"
             )

@@ -174,6 +174,31 @@ async def test_session_launches_owned_profile_records_metadata_and_closes_once(t
 
 
 @pytest.mark.asyncio
+async def test_invalidation_reaps_browser_without_publishing_checkpoint(tmp_path) -> None:
+    state = ProfileStateAdapter(tmp_path)
+    runtime = FakeOwnedBrowser()
+    session = NodriverSession(
+        BrowserConfig(),
+        state,
+        policy(),
+        episode_metadata(),
+        launcher=FakeBrowserLauncher(runtime),
+    )
+    await session.start()
+
+    await session.invalidate(asyncio.CancelledError("task cancelled"))
+    await session.close()
+
+    assert session.lifecycle is SessionLifecycle.CLOSED
+    assert session.terminal_checkpoint is None
+    assert session.restore_authority is None
+    assert len(state.aborted_with) == 1
+    assert isinstance(state.aborted_with[0], asyncio.CancelledError)
+    assert runtime.close_requests == 1
+    assert runtime.connection_closes == 1
+
+
+@pytest.mark.asyncio
 async def test_explicit_checkpoint_rolls_over_and_preserves_lineage(tmp_path) -> None:
     state = ProfileStateAdapter(tmp_path)
     first_runtime = FakeOwnedBrowser()

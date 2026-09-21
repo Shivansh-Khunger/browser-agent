@@ -330,6 +330,33 @@ class NodriverSession:
                 await close_task
             raise
 
+    async def invalidate(self, error: BaseException) -> None:
+        """Stop browser without publishing cancelled episode as restore authority."""
+        async with self._lifecycle_lock:
+            if self._lifecycle is SessionLifecycle.CLOSED:
+                return
+            if self._lifecycle is SessionLifecycle.NEW:
+                self._lifecycle = SessionLifecycle.CLOSED
+                return
+            self._lifecycle = SessionLifecycle.CLOSING
+            await self._cancel_monitor()
+            runtime = self._runtime
+            lease = self._lease
+            try:
+                if runtime is not None:
+                    try:
+                        async with asyncio.timeout(self._config.timeouts.shutdown):
+                            async with self._action_lock:
+                                await runtime.request_close()
+                                await asyncio.shield(runtime.wait_for_exit())
+                                await runtime.close_connection()
+                    except BaseException:
+                        await self._force_stop(runtime)
+                if lease is not None:
+                    await self._abort_episode(lease, error)
+            finally:
+                self._lifecycle = SessionLifecycle.CLOSED
+
     def _require_running(self) -> OwnedBrowser:
         if self._lifecycle is not SessionLifecycle.RUNNING or self._runtime is None:
             if self._fatal_error is not None:
