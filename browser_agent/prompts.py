@@ -166,7 +166,5 @@ SHOT_LABEL = (
     "layout, which popup/dialog is on top, which fields are required or show errors, and anything the "
     "text list misses. Still act by the [index] numbers from the list."
 )
-SHOT_COORDS = (
-    " The image is {w}×{h} px; if you use click_at, x goes 0→right and y goes 0→bottom in that space."
-)
+SHOT_COORDS = " The image is {w}×{h} px; if you use click_at, x goes 0→right and y goes 0→bottom in that space."
 SHOT_OMITTED = "[previous screenshot omitted — see the latest screenshot below]"

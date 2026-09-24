@@ -8,7 +8,8 @@ what has registered itself here.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 # name -> {"schema": openai tool schema, "run": fn | None, "read_only": bool}
 # Insertion-ordered, which is the order the model sees the tools in; it follows
@@ -19,7 +20,9 @@ REGISTRY: dict[str, dict[str, Any]] = {}
 RunFn = Callable[[Any, dict[str, Any]], str]
 
 
-def _schema(name: str, description: str, properties: dict | None, required: list[str] | None) -> dict:
+def _schema(
+    name: str, description: str, properties: dict | None, required: list[str] | None
+) -> dict:
     return {
         "type": "function",
         "function": {
@@ -55,7 +58,14 @@ def tool(
     """
 
     def deco(fn: RunFn) -> RunFn:
-        _register(name, {"schema": _schema(name, description, properties, required), "run": fn, "read_only": read_only})
+        _register(
+            name,
+            {
+                "schema": _schema(name, description, properties, required),
+                "run": fn,
+                "read_only": read_only,
+            },
+        )
         return fn
 
     return deco
@@ -73,7 +83,14 @@ def declare(
     `Agent.run` intercepts them, because they talk to the user or the loop
     rather than the page.
     """
-    _register(name, {"schema": _schema(name, description, properties, required), "run": None, "read_only": False})
+    _register(
+        name,
+        {
+            "schema": _schema(name, description, properties, required),
+            "run": None,
+            "read_only": False,
+        },
+    )
 
 
 def execute(browser, name: str, inp: dict[str, Any]) -> str:

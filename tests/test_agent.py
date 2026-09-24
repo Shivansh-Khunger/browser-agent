@@ -2,7 +2,7 @@
 and history compaction. No browser and no network — everything here is a pure
 function or a method that only touches `self.messages`.
 
-Run with the project venv (it imports the package, which needs openai/camoufox):
+Run with project venv:
 
     .venv/bin/python tests/test_agent.py
 """
@@ -22,41 +22,43 @@ from browser_agent.agent import (  # noqa: E402
     render_state,
     repeat_guard_step,
 )
+from browser_agent.browser import (  # noqa: E402
+    ContextNode,
+    Observation,
+    SemanticControl,
+    TargetHandle,
+    Viewport,
+)
 
 
 def _state(controls, headings=(), url="https://example.com"):
-    """Build a PageState the way BrowserSession.get_state does — `nodes` holds the
-    same dicts as `elements`, so both views see one index."""
-    elements = [
-        {"kind": "control", "index": i, "role": role, "name": name, "text": text, "overlay": overlay}
-        for i, (role, name, text, overlay) in enumerate(controls)
-    ]
-    nodes = [{"kind": "heading", "name": h, "overlay": False} for h in headings] + elements
-    return {"url": url, "title": "T", "elements": elements, "nodes": nodes}
+    return Observation(
+        "o1",
+        "tab-1",
+        url,
+        "T",
+        1,
+        {"main": 1},
+        Viewport(1000, 700),
+        controls=tuple(
+            SemanticControl(TargetHandle("o1", f"c{i}"), role, name)
+            for i, (role, name) in enumerate(controls)
+        ),
+        context=tuple(ContextNode("heading", heading) for heading in headings),
+    )
 
 
 def test_render_state():
-    # A dialog holding a text field is a form to fill.
-    form = _state([("textbox", "Pincode", 'textbox "Pincode"', True)])
-    assert prompts.FORM_BANNER in render_state(form)
-
-    # Buttons plus cookie wording is a blocker to dismiss.
-    cookie = _state([("button", "Accept all", 'button "Accept all cookies"', True)])
-    assert prompts.DISMISS_BANNER in render_state(cookie)
-
-    # Any other dialog is on-task UI to engage with — the modern-site default.
-    cart = _state([("button", "Proceed", 'button "Proceed"', True)])
-    assert prompts.ENGAGE_BANNER in render_state(cart)
-
-    # Non-overlay controls render in the outline with their index; overlay
-    # controls appear only in the banner, never twice.
     mixed = _state(
-        [("button", "Search", 'button "Search"', False), ("button", "Close", 'button "Close"', True)],
+        [
+            ("button", "Search"),
+            ("button", "Close"),
+        ],
         headings=["Results"],
     )
     out = render_state(mixed)
-    assert "# Results" in out and '[0] button "Search"' in out
-    assert out.count('[1] button "Close"') == 1
+    assert "# Results" in out and "[0] button Search" in out
+    assert out.count("[1] button Close") == 1
 
     assert "(no interactive elements)" in render_state(_state([]))
     assert page_signature(mixed) != page_signature(_state([]))
@@ -92,6 +94,7 @@ def test_compact_history():
     the compactor searches for: if SUPERVISOR_INJECT stops containing SUP_MARK,
     the old HTML stops being pruned and the last assertion below fails.
     """
+
     def image(tag):
         return {"role": "user", "content": [{"type": "image_url", "image_url": {"url": tag}}]}
 
@@ -101,7 +104,10 @@ def test_compact_history():
         {"role": "tool", "content": prompts.HTML_PREFIX + "OLD HTML"},
         {"role": "tool", "content": "Clicked [2]" + prompts.PAGE_MARK + "NEW PAGE"},
         image("new.jpg"),
-        {"role": "user", "content": prompts.SUPERVISOR_INJECT.format(advice="scroll", html="SUP HTML")},
+        {
+            "role": "user",
+            "content": prompts.SUPERVISOR_INJECT.format(advice="scroll", html="SUP HTML"),
+        },
     ]
     Agent._compact_history(SimpleNamespace(messages=msgs))
 

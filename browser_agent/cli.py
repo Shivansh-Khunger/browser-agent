@@ -1,111 +1,195 @@
-"""Entry point.
-
-Interactive REPL (no args) or one-shot mode (task passed as arguments). The
-`ask()` bridge (via input()) serves both the main prompt and the agent's
-mid-task `ask_user` / CAPTCHA pauses.
-"""
+"""Async CLI entry point for interactive and one-shot browser tasks."""
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import os
 import sys
+from collections.abc import Callable, Sequence
+from typing import TextIO
 
-from .agent import Agent
-from .config import API_KEY, HEADLESS
+from .agent import Agent, AutomationOutcome
+from .browser import BrowserConfig, NodriverSession
+from .config import (
+    ALLOWED_DOMAINS,
+    API_KEY,
+    BROWSER_EXECUTABLE,
+    HEADLESS,
+    STATE_ENCRYPTION_KEY,
+    STATE_ROOT,
+)
+from .state import (
+    CapturePolicy,
+    EpisodeMetadata,
+    LocalArtifactStore,
+    LocalBrowserStateAdapter,
+)
 
 BANNER = """
 ┌────────────────────────────────────────────┐
-│   🌐  browser-agent                          │
-│   an AI that drives your browser             │
+│   🌐  browser-agent                        │
+│   an AI that drives your browser           │
 └────────────────────────────────────────────┘
-Type a task and press Enter. The agent runs it in the browser.
-It narrates what it's doing, and will ask you questions when something
-is unclear or a real choice/irreversible action comes up.
-Follow-ups continue in the same session.
+Type a task and press Enter. Follow-ups share one browser session.
 
   /help     show commands
   /exit     quit (or Ctrl+C)
-
-Defaults to Indian context (₹ INR, amazon.in, google.co.in) unless you say otherwise.
 """
+
+AgentFactory = Callable[[], Agent]
 
 
 def preflight() -> None:
     if not API_KEY:
-        print(
-            "OPENROUTER_API_KEY is not set. Add it to .env (see .env.example) or your shell.",
-            file=sys.stderr,
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set. Add it to .env (see .env.example) or your shell."
         )
-        sys.exit(1)
 
 
-def ask(question: str) -> str:
-    """Prompt the human. Serves the agent's mid-task `ask_user` calls, the
-    CAPTCHA pause, and the confirmation guard."""
+def _encryption_key() -> bytes:
+    if STATE_ENCRYPTION_KEY:
+        try:
+            key = base64.b64decode(STATE_ENCRYPTION_KEY, validate=True)
+        except ValueError as error:
+            raise RuntimeError("AGENT_STATE_ENCRYPTION_KEY must be valid base64") from error
+        if len(key) != 32:
+            raise RuntimeError("AGENT_STATE_ENCRYPTION_KEY must decode to exactly 32 bytes")
+        return key
+    key_path = STATE_ROOT / "checkpoint.key"
+    key_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        return input(f"\n🤔 {question}\n   ❯ ")
-    except EOFError:
-        return ""
+        key = key_path.read_bytes()
+    except FileNotFoundError:
+        key = os.urandom(32)
+        descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(key)
+    if len(key) != 32:
+        raise RuntimeError(f"checkpoint key at {key_path} must contain exactly 32 bytes")
+    return key
 
 
-def one_shot(task: str) -> None:
-    agent = Agent()
-    agent.start(HEADLESS)
-    print(f"\n🎯 Task: {task}\n")
+def build_agent() -> Agent:
+    artifacts = LocalArtifactStore(STATE_ROOT / "artifacts", encryption_key=_encryption_key())
+    state = LocalBrowserStateAdapter(STATE_ROOT / "browser", artifacts)
+    session = NodriverSession(
+        BrowserConfig(
+            headless=HEADLESS,
+            executable_path=BROWSER_EXECUTABLE,
+            allowed_domains=tuple(ALLOWED_DOMAINS),
+        ),
+        state,
+        CapturePolicy(
+            version="capture-v1",
+            redaction_policy_version="redaction-v1",
+            restricted_storage=True,
+        ),
+        EpisodeMetadata(code_revision="working-tree", platform=sys.platform, task_id="cli"),
+    )
+    return Agent(session)
+
+
+async def ask(question: str, *, input_fn: Callable[[str], str] = input) -> str:
+    return await asyncio.to_thread(input_fn, f"\n🤔 {question}\n   ❯ ")
+
+
+async def one_shot(
+    task: str,
+    *,
+    agent_factory: AgentFactory = build_agent,
+    input_fn: Callable[[str], str] = input,
+    stdout: TextIO = sys.stdout,
+) -> int:
+    agent = agent_factory()
     try:
-        answer = agent.run(task, ask)
-        print(f"\n✅ Result:\n{answer}\n")
+        await agent.start()
+        print(f"\n🎯 Task: {task}\n", file=stdout)
+        result = await agent.run(task, lambda question: ask(question, input_fn=input_fn))
+        print(f"\n✅ Result:\n{result.answer}\n", file=stdout)
+        if result.automation_outcome is AutomationOutcome.FAILED:
+            print("Automation outcome: failed (human intervention required)", file=stdout)
+        return 0
     finally:
-        agent.close()
+        await agent.close()
 
 
-def interactive() -> None:
-    # Interactive mode shows the browser by default so you can watch it work.
-    agent = Agent()
-    agent.start(HEADLESS)
-
-    print(BANNER)
-
+async def interactive(
+    *,
+    agent_factory: AgentFactory = build_agent,
+    input_fn: Callable[[str], str] = input,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+) -> int:
+    agent = agent_factory()
+    await agent.start()
+    print(BANNER, file=stdout)
     try:
         while True:
             try:
-                task = input("❯ ").strip()
+                task = (await asyncio.to_thread(input_fn, "❯ ")).strip()
             except EOFError:
-                break  # Ctrl+D
+                break
             if not task:
                 continue
-            if task in ("/exit", "/quit"):
+            if task in {"/exit", "/quit"}:
                 break
             if task == "/help":
-                print("\n  Just type what you want done, e.g.:")
-                print("    recommend a guitar under 30k")
-                print("    open flipkart and find the cheapest 1TB SSD")
-                print("  The agent will ask you if anything is unclear.")
-                print("  /exit to quit. Follow-ups stay in the same browser session.\n")
+                print("Type a browser task. /exit quits; follow-ups share session.", file=stdout)
                 continue
-
             try:
-                answer = agent.run(task, ask)
-                print(f"\n✅ {answer}\n")
-            except Exception as err:
-                print(f"\n❌ {err}\n", file=sys.stderr)
-    except KeyboardInterrupt:
-        pass  # Ctrl+C — fall through to a clean shutdown
+                result = await agent.run(task, lambda question: ask(question, input_fn=input_fn))
+                print(f"\n✅ {result.answer}\n", file=stdout)
+                if result.automation_outcome is AutomationOutcome.FAILED:
+                    print("Automation outcome: failed (human intervention required)\n", file=stdout)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                print(f"\n❌ {error}\n", file=stderr)
+        return 0
     finally:
-        agent.close()
+        await agent.close()
+
+
+async def async_main(
+    argv: Sequence[str] | None = None,
+    *,
+    agent_factory: AgentFactory = build_agent,
+    input_fn: Callable[[str], str] = input,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+) -> int:
+    try:
+        preflight()
+        args = list(sys.argv[1:] if argv is None else argv)
+        task = " ".join(args).strip()
+        if task:
+            return await one_shot(
+                task,
+                agent_factory=agent_factory,
+                input_fn=input_fn,
+                stdout=stdout,
+            )
+        return await interactive(
+            agent_factory=agent_factory,
+            input_fn=input_fn,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    except asyncio.CancelledError:
+        return 130
+    except Exception as error:
+        print(f"\n❌ Error: {error}\n", file=stderr)
+        return 1
 
 
 def main() -> None:
-    preflight()
-    task = " ".join(sys.argv[1:]).strip()
-    if task:
-        one_shot(task)  # backwards-compatible single-task mode
-        return
-    interactive()
+    try:
+        status = asyncio.run(async_main())
+    except KeyboardInterrupt:
+        status = 130
+    raise SystemExit(status)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as err:  # noqa: BLE001
-        print(f"\n❌ Error: {err}\n", file=sys.stderr)
-        sys.exit(1)
+    main()
