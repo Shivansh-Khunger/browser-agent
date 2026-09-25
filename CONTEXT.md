@@ -86,6 +86,10 @@ _Avoid_: E2E test, scenario
 A local, seeded, deterministic web application that task evals run against, whose server-side state graders can inspect.
 _Avoid_: Mock site, test page
 
+**Fixture view**:
+A named screen of a fixture site that can be loaded directly from a URL and a seed, and recognized in an observation without a model. Eval cases name the views they pass through and the controls each one must offer.
+_Avoid_: Page state, fixture page, screen
+
 **Eval suite**:
 A named, versioned collection of eval cases run together.
 _Avoid_: Dataset, benchmark
@@ -109,3 +113,11 @@ _Avoid_: Scorer, metric, evaluator
 **Comparison**:
 A paired evaluation of a baseline variant against a candidate variant over the same eval suite and trial count, reported per case.
 _Avoid_: A/B test, benchmark run
+
+**Observation fidelity check**:
+A code check, made without any model call, that a control an eval case needs was captured, kept, described truthfully, shown with its actionability, and rendered unambiguously in what the model saw under a given variant.
+_Avoid_: Perception test, observation test
+
+**Failure attribution**:
+The label explaining why a failed trial failed — a browser fault (an action landed on a different control than the one chosen), a perception gap, a model decision, or unattributed — derived from observation fidelity checks. It sits beside grades and never changes them.
+_Avoid_: Root cause, blame
