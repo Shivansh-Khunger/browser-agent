@@ -90,6 +90,14 @@ _Avoid_: Mock site, test page
 A named screen of a fixture site that can be loaded directly from a URL and a seed, and recognized in an observation without a model. Eval cases name the views they pass through and the controls each one must offer.
 _Avoid_: Page state, fixture page, screen
 
+**Reference solution**:
+A human-written path through a task eval's fixture site, derived from the task's intent and replayable without a model, that proves the case solvable and its graders correct. Graders never require the agent to follow it.
+_Avoid_: Golden path, expected trajectory
+
+**Simulated user**:
+The scripted stand-in for the person during a trial. It answers questions, confirmations, and verification pauses from the eval case's rules; anything unscripted gets a fixed, safe reply and flags the trial.
+_Avoid_: Mock user, user simulator
+
 **Eval suite**:
 A named, versioned collection of eval cases run together.
 _Avoid_: Dataset, benchmark
